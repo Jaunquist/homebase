@@ -1,11 +1,8 @@
-/* Homebase front end (app.js), Phase 1 */
+/* Homebase front end (app.js), Phase 1.1 (speed update) */
 'use strict';
 
-/* ================= Config: paste your two values here ================= */
-const CONFIG = {
-  API_URL: 'https://script.google.com/macros/s/AKfycbxBV8dUCl7xSzcn_Z7MKintWRtftX7bEYPk9ZbYh6qNA4YxCVf-HAFpUvQeu8WJLRDVAA/exec',            // ends in /exec
-  CLIENT_ID: '971030994509-v5nislpuifsen0ll1iqhir7r20jk82rg.apps.googleusercontent.com',
-};
+/* ================= Config comes from config.js ================= */
+const CONFIG = window.HB_CONFIG || {};
 
 /* ================= Constants ================= */
 const TYPES = {
@@ -15,7 +12,9 @@ const TYPES = {
   task: { label: 'Task', plural: 'Tasks', hint: 'Anything else with a date' },
 };
 const FREQ = { weekly: ['week', 'weeks'], monthly: ['month', 'months'], quarterly: ['quarter', 'quarters'], yearly: ['year', 'years'] };
-const EVENT_HORIZON_DAYS = 30; // events show in Upcoming only when this close
+const EVENT_HORIZON_DAYS = 30;   // events show in Upcoming only when this close
+const REQUEST_TIMEOUT_MS = 45000;
+const LOCAL_DATA_KEY = 'hb_data';
 const ICON = {
   x: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
   left: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>',
@@ -25,7 +24,7 @@ const ICON = {
 /* ================= State ================= */
 const store = {
   get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
-  set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* storage unavailable */ } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* storage full or unavailable */ } },
   del(k) { try { localStorage.removeItem(k); } catch (e) { /* storage unavailable */ } },
 };
 
@@ -33,6 +32,9 @@ const S = {
   token: null,
   claims: null,
   data: null,
+  fromLocal: false,     // true while showing the saved copy, before the server replies
+  syncedAt: 0,          // when the server last confirmed the data
+  timing: null,         // last request timing, shown in More > Account
   tab: 'upcoming',
   who: store.get('hb_who') === 'mine' ? 'mine' : 'all',
   typeFilter: 'all',
@@ -41,7 +43,7 @@ const S = {
   selecting: false,
   picked: new Set(),
   busy: 0,
-  loadedAt: 0,
+  hashOpened: false,
 };
 
 /* ================= Small helpers ================= */
@@ -87,6 +89,9 @@ function fmtTime(t) {
   if (!t) return '';
   const [h, m] = t.split(':').map(Number);
   return `${((h + 11) % 12) + 1}${m ? ':' + pad(m) : ''}${h >= 12 ? 'pm' : 'am'}`;
+}
+function fmtClock(ms) {
+  return new Date(ms).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
 }
 function peso(n) {
   const v = Number(n) || 0;
@@ -211,29 +216,65 @@ function sortOcc(a, b) {
   return a.date.localeCompare(b.date) || (a.time || '99').localeCompare(b.time || '99') || a.item.title.localeCompare(b.item.title);
 }
 
+/* ================= Saved copy on this device ================= */
+function saveLocal(d) {
+  store.set(LOCAL_DATA_KEY, JSON.stringify({ email: d.me.email, savedAt: Date.now(), data: d }));
+}
+function loadLocal(email) {
+  try {
+    const j = JSON.parse(store.get(LOCAL_DATA_KEY) || 'null');
+    if (j && j.data && email && j.email === String(email).toLowerCase()) return j;
+  } catch (e) { /* ignore a corrupt copy */ }
+  return null;
+}
+
 /* ================= API ================= */
-async function api(action, payload = {}) {
+async function api(action, payload = {}, opts = {}) {
   await ensureFreshToken();
   setBusy(1);
+  const t0 = performance.now();
   try {
-    let res;
-    try {
-      res = await fetch(CONFIG.API_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids a CORS preflight
-        body: JSON.stringify({ action, payload, token: S.token }),
-      });
-    } catch (e) {
-      throw Object.assign(new Error("Couldn't reach Homebase. Check your connection and try again."), { code: 'NETWORK' });
+    const attempts = opts.retry ? 2 : 1;
+    let lastErr;
+    for (let n = 0; n < attempts; n++) {
+      try {
+        const j = await postOnce(action, payload);
+        S.timing = { action, totalMs: Math.round(performance.now() - t0), server: j.ms || null };
+        console.info('[Homebase]', action, S.timing);
+        if (!j.ok) throw Object.assign(new Error(j.error || 'Something went wrong.'), { code: j.code });
+        return j.data;
+      } catch (e) {
+        lastErr = e;
+        if (e.code !== 'NETWORK' && e.code !== 'TIMEOUT') throw e;
+      }
     }
-    let j;
-    try { j = await res.json(); } catch (e) {
-      throw Object.assign(new Error('Homebase sent an unexpected reply. Check that the Apps Script deployment is set to "Anyone".'), { code: 'BAD_REPLY' });
-    }
-    if (!j.ok) throw Object.assign(new Error(j.error || 'Something went wrong.'), { code: j.code });
-    return j.data;
+    throw lastErr;
   } finally {
     setBusy(-1);
+  }
+}
+
+async function postOnce(action, payload) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), REQUEST_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(CONFIG.API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids a CORS preflight
+      body: JSON.stringify({ action, payload, token: S.token }),
+      signal: ctl.signal,
+    });
+  } catch (e) {
+    if (e.name === 'AbortError') throw Object.assign(new Error('Homebase took too long to respond. Try again.'), { code: 'TIMEOUT' });
+    throw Object.assign(new Error("Couldn't reach Homebase. Check your connection and try again."), { code: 'NETWORK' });
+  } finally {
+    clearTimeout(timer);
+  }
+  try {
+    return await res.json();
+  } catch (e) {
+    throw Object.assign(new Error('Homebase sent an unexpected reply. Check that the Apps Script deployment is set to "Anyone".'), { code: 'BAD_REPLY' });
   }
 }
 
@@ -248,9 +289,10 @@ async function mutate(action, payload, doneMsg) {
   }
 }
 
-function setData(d) {
+function setData(d, fromLocal = false) {
   S.data = d;
-  S.loadedAt = Date.now();
+  S.fromLocal = fromLocal;
+  if (!fromLocal) { S.syncedAt = Date.now(); saveLocal(d); }
   if (!S.cal.cursor) { S.cal.cursor = today(); S.cal.selected = today(); }
   if (!S.bills.cursor) S.bills.cursor = today();
   S.picked.forEach((id) => { const i = itemById(id); if (!i || !canComplete(i)) S.picked.delete(id); });
@@ -258,10 +300,8 @@ function setData(d) {
 }
 
 function handleErr(e) {
-  if (e.code === 'AUTH' || e.code === 'NOT_INVITED') {
-    signOut(e.message);
-    return;
-  }
+  if (e.code === 'AUTH') { signOut(e.message, { keepLocal: true }); return; }
+  if (e.code === 'NOT_INVITED') { signOut(e.message); return; }
   toast(e.message, true);
 }
 
@@ -322,7 +362,7 @@ function onCredential(resp) {
 
 /** ID tokens last about an hour. Refresh quietly through One Tap before a call if needed. */
 function ensureFreshToken() {
-  if (S.claims && S.claims.exp * 1000 > Date.now() + 60000) return Promise.resolve();
+  if (S.claims && S.token && S.claims.exp * 1000 > Date.now() + 60000) return Promise.resolve();
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       pendingToken = null;
@@ -348,26 +388,34 @@ function showSignIn(msg) {
   });
 }
 
-function signOut(msg) {
+/** keepLocal: an expired sign-in keeps the saved copy so the next sign-in opens instantly. */
+function signOut(msg, opts = {}) {
   store.del('hb_token');
-  S.token = null; S.claims = null; S.data = null;
+  if (!opts.keepLocal) store.del(LOCAL_DATA_KEY);
+  S.token = null; S.claims = null; S.data = null; S.fromLocal = false;
   closeAllSheets();
-  if (window.google && google.accounts && google.accounts.id) google.accounts.id.disableAutoSelect();
+  if (window.google && google.accounts && google.accounts.id && !opts.keepLocal) google.accounts.id.disableAutoSelect();
   showSignIn(msg);
 }
 
 /* ================= Boot ================= */
 function boot() {
-  if (CONFIG.API_URL.startsWith('PASTE') || CONFIG.CLIENT_ID.startsWith('PASTE')) {
+  if (!CONFIG.API_URL || !CONFIG.CLIENT_ID || CONFIG.API_URL.startsWith('PASTE') || CONFIG.CLIENT_ID.startsWith('PASTE')) {
     $('#signin').hidden = false;
-    $('#signin-msg').textContent = 'Setup needed: add your API_URL and CLIENT_ID at the top of app.js.';
+    $('#signin-msg').textContent = 'Setup needed: add your API_URL and CLIENT_ID to config.js.';
     return;
   }
   applyTheme();
   const saved = store.get('hb_token');
   const c = saved && decodeJwt(saved);
-  if (c && c.exp * 1000 > Date.now() + 60000) {
-    S.token = saved; S.claims = c;
+  if (!c) { showSignIn(); return; }
+
+  const fresh = c.exp * 1000 > Date.now() + 60000;
+  const local = loadLocal(c.email);
+  if (fresh || local) {
+    // With a saved copy, open instantly even if the sign-in needs a quiet refresh first.
+    S.token = saved;
+    S.claims = c;
     load();
   } else {
     showSignIn();
@@ -377,26 +425,47 @@ function boot() {
 async function load() {
   $('#signin').hidden = true;
   $('#app').hidden = false;
-  if (!S.data) $('#main').innerHTML = '<p class="empty">Loading your household…</p>';
+  if (!S.data) {
+    const local = S.claims && loadLocal(S.claims.email);
+    if (local) {
+      setData(local.data, true);
+      S.syncedAt = local.savedAt;
+      openFromHashOnce();
+    } else {
+      $('#main').innerHTML = '<p class="empty">Loading your household…</p>';
+    }
+  }
+  await refresh();
+}
+
+async function refresh() {
+  const hadData = !!S.data;
   try {
-    setData(await api('bootstrap'));
-    openFromHash();
+    setData(await api('bootstrap', {}, { retry: true }));
+    openFromHashOnce();
   } catch (e) {
-    handleErr(e);
-    if (!S.data && e.code !== 'AUTH' && e.code !== 'NOT_INVITED') {
+    if (e.code === 'AUTH' || e.code === 'NOT_INVITED') { handleErr(e); return; }
+    if (hadData) {
+      toast(`Showing saved data. ${e.message}`, true);
+    } else {
       $('#main').innerHTML = `<div class="empty"><strong>Homebase didn't load</strong>${esc(e.message)}<p><button class="btn" data-act="reload">Try again</button></p></div>`;
     }
   }
 }
 
+function openFromHashOnce() {
+  if (S.hashOpened) return;
+  S.hashOpened = true;
+  openFromHash();
+}
 function openFromHash() {
   const m = location.hash.match(/item=([\w-]+)/);
   if (m && itemById(m[1])) openDetail(m[1]);
 }
 
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && S.data && !document.body.classList.contains('sheet-open') && Date.now() - S.loadedAt > 60000) {
-    api('bootstrap').then(setData).catch(() => { /* stay quiet on background refresh */ });
+  if (document.visibilityState === 'visible' && S.data && !document.body.classList.contains('sheet-open') && Date.now() - S.syncedAt > 60000) {
+    refresh();
   }
 });
 window.addEventListener('hashchange', () => S.data && openFromHash());
@@ -620,6 +689,16 @@ function renderBills() {
 }
 
 /* ----- More ----- */
+function syncLine() {
+  if (!S.syncedAt) return '';
+  let line = `${S.fromLocal ? 'Showing saved data from' : 'Last updated'} ${fmtClock(S.syncedAt)}`;
+  const t = S.timing;
+  if (t && t.server) {
+    line += `. Last request: ${(t.totalMs / 1000).toFixed(1)}s total, ${(t.server.total / 1000).toFixed(1)}s on the server, cache ${t.server.cache}`;
+  }
+  return `<small>${esc(line)}.</small>`;
+}
+
 function renderMore() {
   const theme = store.get('hb_theme') || 'system';
   const admin = isAdmin();
@@ -689,6 +768,8 @@ function renderMore() {
       <h2>Account</h2>
       <div class="member">${avatar(me())}<div class="who-info">${esc(S.data.me.name)}<small>${esc(me())}</small></div>
         <button class="btn sm" data-act="signout">Sign out</button></div>
+      <div class="member"><div class="who-info">Sync${syncLine()}</div>
+        <button class="btn sm" data-act="reload" data-busy>Refresh</button></div>
     </section>`;
 }
 
@@ -715,6 +796,9 @@ const HELP_HTML = `
 <details><summary>Archiving and deleting</summary><div class="answer">
   <p>Archiving hides an item without losing its history. Restore it anytime from the Archive below. Only the admin can delete permanently.</p>
 </div></details>
+<details><summary>Why the list sometimes updates a moment after opening</summary><div class="answer">
+  <p>Homebase shows the copy saved on this phone right away, then checks for changes from the rest of the family. The thin bar at the top means it's checking. Signing out removes the saved copy from this phone.</p>
+</div></details>
 <details><summary>Google Calendar</summary><div class="answer">
   <p class="soon">Calendar sync arrives in the next update.</p>
   <p>Each item will appear on the shared family calendar as one event with a link back here. To add something from Google Calendar, put <b>#home</b> in the event title.</p>
@@ -740,6 +824,7 @@ function openSheet(html, opts = {}) {
   el.addEventListener('click', (ev) => { if (ev.target === el) closeSheet(); });
   requestAnimationFrame(() => el.classList.add('in'));
   if (opts.onMount) opts.onMount(el);
+  setBusy(0); // apply the current busy state to the new sheet's buttons
   return el;
 }
 
@@ -976,7 +1061,7 @@ document.addEventListener('click', async (ev) => {
 
   switch (act) {
     case 'close': closeSheet(); break;
-    case 'reload': load(); break;
+    case 'reload': if (S.data) refresh(); else load(); break;
     case 'tab':
       S.tab = a.dataset.tab;
       if (S.tab !== 'upcoming') { S.selecting = false; S.picked.clear(); }
@@ -1062,8 +1147,10 @@ document.addEventListener('click', async (ev) => {
       await mutate('saveCategories', { categories: S.data.categories.filter((c) => c !== v) }, 'Category removed');
       break;
     case 'user-reinvite':
-      await mutate('inviteUser', { email: a.dataset.email, resend: true,
-        role: (S.data.users.find((u) => u.email === a.dataset.email) || {}).role }, 'Invite sent');
+      await mutate('inviteUser', {
+        email: a.dataset.email, resend: true,
+        role: (S.data.users.find((u) => u.email === a.dataset.email) || {}).role,
+      }, 'Invite sent');
       break;
     case 'user-remove':
       if (!confirm(`Remove ${displayName(a.dataset.email)}? They won't be able to sign in.`)) break;
