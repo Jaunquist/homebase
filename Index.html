@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Homebase</title>
+  <meta name="theme-color" content="#EDF0EE">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:wght@400;600;700&display=swap">
+  <link rel="stylesheet" href="styles.css?v=1">
+  <script>
+    // Apply the saved theme before first paint to avoid a flash.
+    try {
+      var t = localStorage.getItem('hb_theme');
+      if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+    } catch (e) {}
+  </script>
+  <script src="https://accounts.google.com/gsi/client" async></script>
+  <script src="app.js?v=1" defer></script>
+</head>
+<body>
+  <div id="busy" class="busy" hidden></div>
+
+  <section id="signin" class="signin" hidden>
+    <div class="signin-inner">
+      <h1 class="brand brand-lg">Homebase</h1>
+      <p class="signin-lede">Upkeep, bills and family dates in one shared schedule.</p>
+      <div id="gsi-btn" class="gsi-btn"></div>
+      <p id="signin-msg" class="signin-msg" role="alert"></p>
+    </div>
+  </section>
+
+  <div id="app" hidden>
+    <header class="top">
+      <h1 class="brand">Homebase</h1>
+      <span id="today-label" class="today-label"></span>
+    </header>
+    <main id="main" class="main" tabindex="-1"></main>
+    <div id="selectbar" class="selectbar" hidden></div>
+    <nav class="tabbar" aria-label="Sections">
+      <button data-act="tab" data-tab="upcoming">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h11M9 12h11M9 18h11"/><circle cx="4.5" cy="6" r="1.2" class="fill"/><circle cx="4.5" cy="12" r="1.2" class="fill"/><circle cx="4.5" cy="18" r="1.2" class="fill"/></svg>
+        <span>Upcoming</span>
+      </button>
+      <button data-act="tab" data-tab="calendar">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M3.5 10h17M8 3v4M16 3v4"/></svg>
+        <span>Calendar</span>
+      </button>
+      <button data-act="add" class="tab-add" aria-label="Add">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+      <button data-act="tab" data-tab="bills">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6M9 16h3"/></svg>
+        <span>Bills</span>
+      </button>
+      <button data-act="tab" data-tab="more">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.6" class="fill"/><circle cx="12" cy="12" r="1.6" class="fill"/><circle cx="19" cy="12" r="1.6" class="fill"/></svg>
+        <span>More</span>
+      </button>
+    </nav>
+  </div>
+
+  <div id="sheets"></div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
