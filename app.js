@@ -3,8 +3,8 @@
 
 /* ================= Config: paste your two values here ================= */
 const CONFIG = {
-  API_URL: 'PASTE_YOUR_APPS_SCRIPT_WEB_APP_URL',            // ends in /exec
-  CLIENT_ID: 'PASTE_YOUR_CLIENT_ID.apps.googleusercontent.com',
+  API_URL: 'https://script.google.com/macros/s/AKfycbxBV8dUCl7xSzcn_Z7MKintWRtftX7bEYPk9ZbYh6qNA4YxCVf-HAFpUvQeu8WJLRDVAA/exec',            // ends in /exec
+  CLIENT_ID: '971030994509-v5nislpuifsen0ll1iqhir7r20jk82rg.apps.googleusercontent.com',
 };
 
 /* ================= Constants ================= */
