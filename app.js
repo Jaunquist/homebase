@@ -1,4 +1,4 @@
-/* Homebase front end (app.js), Phase 1.1 (speed update) */
+/* Homebase front end (app.js), Phase 1.2 (instant, safe-to-repeat saves) */
 'use strict';
 
 /* ================= Config comes from config.js ================= */
@@ -15,6 +15,9 @@ const FREQ = { weekly: ['week', 'weeks'], monthly: ['month', 'months'], quarterl
 const EVENT_HORIZON_DAYS = 30;   // events show in Upcoming only when this close
 const REQUEST_TIMEOUT_MS = 45000;
 const LOCAL_DATA_KEY = 'hb_data';
+const QUEUE_KEY = 'hb_queue';
+const BAD_REPLY_KEY = 'hb_bad_reply';
+const UNKNOWN_OUTCOME = new Set(['NETWORK', 'TIMEOUT', 'BAD_REPLY']);
 const ICON = {
   x: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
   left: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>',
@@ -31,7 +34,10 @@ const store = {
 const S = {
   token: null,
   claims: null,
-  data: null,
+  data: null,           // what the screen shows: server data plus changes still being saved
+  server: null,         // the last data confirmed by the server
+  queue: [],            // changes waiting to be saved, in order
+  badReply: null,       // last reply the app couldn't read (diagnostics)
   fromLocal: false,     // true while showing the saved copy, before the server replies
   syncedAt: 0,          // when the server last confirmed the data
   timing: null,         // last request timing, shown in More > Account
@@ -50,6 +56,18 @@ const S = {
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const pad = (n) => String(n).padStart(2, '0');
+const clone = (o) => JSON.parse(JSON.stringify(o));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function rid(prefix) {
+  const hex = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()) + Date.now()).replace(/[^a-f0-9]/gi, '');
+  return prefix + hex.slice(0, 16).padEnd(16, '0');
+}
+function nowIso() {
+  const d = new Date();
+  const off = -d.getTimezoneOffset();
+  const sign = off >= 0 ? '+' : '-';
+  return `${today()}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}${sign}${pad(Math.floor(Math.abs(off) / 60))}:${pad(Math.abs(off) % 60)}`;
+}
 
 function today() {
   const d = new Date();
@@ -227,6 +245,17 @@ function loadLocal(email) {
   } catch (e) { /* ignore a corrupt copy */ }
   return null;
 }
+function persistQueue() {
+  if (S.queue.length) store.set(QUEUE_KEY, JSON.stringify({ email: S.claims ? String(S.claims.email).toLowerCase() : '', ops: S.queue }));
+  else store.del(QUEUE_KEY);
+}
+function loadQueue(email) {
+  try {
+    const j = JSON.parse(store.get(QUEUE_KEY) || 'null');
+    if (j && Array.isArray(j.ops) && email && j.email === String(email).toLowerCase()) return j.ops;
+  } catch (e) { /* ignore */ }
+  return [];
+}
 
 /* ================= API ================= */
 async function api(action, payload = {}, opts = {}) {
@@ -245,7 +274,8 @@ async function api(action, payload = {}, opts = {}) {
         return j.data;
       } catch (e) {
         lastErr = e;
-        if (e.code !== 'NETWORK' && e.code !== 'TIMEOUT') throw e;
+        if (!UNKNOWN_OUTCOME.has(e.code)) throw e;
+        if (n < attempts - 1) await sleep(1200);
       }
     }
     throw lastErr;
@@ -266,38 +296,217 @@ async function postOnce(action, payload) {
       signal: ctl.signal,
     });
   } catch (e) {
-    if (e.name === 'AbortError') throw Object.assign(new Error('Homebase took too long to respond. Try again.'), { code: 'TIMEOUT' });
-    throw Object.assign(new Error("Couldn't reach Homebase. Check your connection and try again."), { code: 'NETWORK' });
-  } finally {
     clearTimeout(timer);
+    if (e.name === 'AbortError') throw Object.assign(new Error('Homebase took too long to respond.'), { code: 'TIMEOUT' });
+    throw Object.assign(new Error("Couldn't reach Homebase. Check your connection."), { code: 'NETWORK' });
   }
+  let text = '';
   try {
-    return await res.json();
+    text = await res.text();
   } catch (e) {
-    throw Object.assign(new Error('Homebase sent an unexpected reply. Check that the Apps Script deployment is set to "Anyone".'), { code: 'BAD_REPLY' });
+    clearTimeout(timer);
+    throw Object.assign(new Error('The reply from Homebase was cut off.'), { code: 'NETWORK' });
+  }
+  clearTimeout(timer);
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    // Record what actually came back, so we can see where it came from.
+    let host = '';
+    try { host = new URL(res.url).host; } catch (e2) { host = '(unknown)'; }
+    S.badReply = {
+      at: Date.now(), action, status: res.status, host, redirected: res.redirected,
+      snippet: text.replace(/\s+/g, ' ').slice(0, 300),
+    };
+    store.set(BAD_REPLY_KEY, JSON.stringify(S.badReply));
+    console.warn('[Homebase] unreadable reply', S.badReply);
+    throw Object.assign(new Error('Homebase sent a reply the app could not read.'), { code: 'BAD_REPLY' });
   }
 }
 
-async function mutate(action, payload, doneMsg) {
-  try {
-    setData(await api(action, payload));
-    if (doneMsg) toast(doneMsg);
-    return true;
-  } catch (e) {
-    handleErr(e);
-    return false;
+/* ================= Local copy of the server's rules (for instant changes) ================= */
+// Each function changes the data the same way the server will. Re-applying one is harmless,
+// because the server's newer data may already include it.
+
+function normalizeItem(input) {
+  const c = {};
+  ['id', 'type', 'title', 'notes', 'assignees', 'category', 'amount', 'recurMode', 'freq', 'interval', 'afterDays',
+    'dueDate', 'dueTime', 'flow', 'leadDays', 'vendorName', 'vendorPhone', 'eventKind', 'eventDate', 'showYears']
+    .forEach((k) => { if (input[k] !== undefined && input[k] !== null) c[k] = String(input[k]).trim(); });
+  c.assignees = String(c.assignees || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean).join(',');
+  if (c.type === 'event') {
+    c.recurMode = 'yearly'; c.dueDate = ''; c.flow = '';
+  } else {
+    if (!['none', 'fixed', 'after'].includes(c.recurMode)) c.recurMode = 'none';
+    if (c.recurMode === 'fixed') {
+      if (!FREQ[c.freq]) c.freq = 'monthly';
+      if (!(Number(c.interval) >= 1)) c.interval = '1';
+    }
+    if (c.type !== 'upkeep' || c.flow !== 'two') c.flow = c.type === 'upkeep' ? 'one' : '';
+    if (c.type !== 'bill') { c.amount = ''; c.category = ''; }
   }
+  return c;
 }
 
-function setData(d, fromLocal = false) {
+function advanceLocal(it, fromDate, by) {
+  if (it.recurMode === 'fixed') it.dueDate = nextFixed(it.dueDate, it.freq, it.interval, it.anchorDay);
+  else if (it.recurMode === 'after') it.dueDate = addDays(fromDate, Number(it.afterDays) || 1);
+  else it.status = 'done';
+  if (it.flow === 'two') { it.stage = 'to_book'; it.apptDate = ''; it.apptTime = ''; }
+  it.updatedBy = by; it.updatedAt = nowIso();
+}
+
+const APPLY = {
+  saveItem(d, p, by) {
+    const c = normalizeItem(p.item);
+    const cur = d.items.find((i) => i.id === c.id);
+    const now = nowIso();
+    if (cur) {
+      const oldDue = cur.dueDate;
+      Object.assign(cur, c, { updatedBy: by, updatedAt: now });
+      if (cur.recurMode === 'fixed' && (oldDue !== cur.dueDate || !cur.anchorDay)) cur.anchorDay = String(Number(cur.dueDate.slice(8, 10)));
+      if (cur.flow !== 'two') { cur.stage = ''; cur.apptDate = ''; cur.apptTime = ''; }
+      else if (!cur.stage) cur.stage = 'to_book';
+    } else {
+      d.items.push(Object.assign(c, {
+        status: 'active', stage: c.flow === 'two' ? 'to_book' : '', apptDate: '', apptTime: '',
+        anchorDay: c.recurMode === 'fixed' ? String(Number(c.dueDate.slice(8, 10))) : '',
+        createdBy: by, createdAt: now, updatedBy: by, updatedAt: now,
+      }));
+    }
+  },
+  archiveItem(d, p, by) { const it = d.items.find((i) => i.id === p.id); if (it) Object.assign(it, { status: 'archived', updatedBy: by, updatedAt: nowIso() }); },
+  restoreItem(d, p, by) { const it = d.items.find((i) => i.id === p.id); if (it) Object.assign(it, { status: 'active', updatedBy: by, updatedAt: nowIso() }); },
+  deleteItem(d, p) { d.items = d.items.filter((i) => i.id !== p.id); },
+  complete(d, p, by) {
+    if (d.completions.some((c) => c.id === p.cid)) return;
+    const it = d.items.find((i) => i.id === p.id);
+    if (!it || it.status !== 'active' || it.type === 'event') return;
+    const isBill = it.type === 'bill';
+    const doneDate = p.doneDate || today();
+    d.completions.push({
+      id: p.cid, itemId: it.id, itemTitle: it.title, type: it.type, category: isBill ? it.category : '', kind: 'done',
+      dueDate: it.stage === 'booked' && it.apptDate ? it.apptDate : it.dueDate, doneDate,
+      amount: isBill ? String(p.amount !== undefined && p.amount !== '' ? p.amount : (it.amount || '')) : '',
+      paidBy: isBill ? String(p.paidBy || by).toLowerCase() : '', note: p.note || '', by, at: nowIso(),
+    });
+    advanceLocal(it, doneDate, by);
+  },
+  bulkComplete(d, p, by) { (p.items || []).forEach((x) => APPLY.complete(d, { id: x.id, cid: x.cid }, by)); },
+  skip(d, p, by) {
+    if (d.completions.some((c) => c.id === p.cid)) return;
+    const it = d.items.find((i) => i.id === p.id);
+    if (!it || it.status !== 'active' || it.recurMode === 'none') return;
+    d.completions.push({
+      id: p.cid, itemId: it.id, itemTitle: it.title, type: it.type, category: it.type === 'bill' ? it.category : '',
+      kind: 'skipped', dueDate: it.dueDate, doneDate: today(), amount: '', paidBy: '', note: '', by, at: nowIso(),
+    });
+    advanceLocal(it, it.dueDate, by);
+  },
+  book(d, p, by) { const it = d.items.find((i) => i.id === p.id); if (it) Object.assign(it, { stage: 'booked', apptDate: p.apptDate, apptTime: p.apptTime || '', updatedBy: by, updatedAt: nowIso() }); },
+  unbook(d, p, by) { const it = d.items.find((i) => i.id === p.id); if (it) Object.assign(it, { stage: 'to_book', apptDate: '', apptTime: '', updatedBy: by, updatedAt: nowIso() }); },
+  deleteCompletion(d, p) { d.completions = d.completions.filter((c) => c.id !== p.id); },
+  saveCategories(d, p) { d.categories = p.categories.slice(); },
+  inviteUser(d, p) {
+    const email = String(p.email).toLowerCase();
+    const u = d.users.find((x) => x.email === email);
+    if (u) Object.assign(u, { name: p.name || u.name, role: p.role || u.role, status: u.status === 'active' ? 'active' : 'invited' });
+    else d.users.push({ email, name: p.name || '', role: p.role === 'admin' ? 'admin' : 'member', status: 'invited' });
+  },
+  updateUser(d, p) { const u = d.users.find((x) => x.email === p.email); if (u) u.role = p.role; },
+  removeUser(d, p) { const u = d.users.find((x) => x.email === p.email); if (u) u.status = 'removed'; },
+};
+
+// After an unreadable reply: did the change reach the server anyway?
+const LANDED = {
+  saveItem: (d, p) => d.items.some((i) => i.id === p.item.id && i.title === String(p.item.title).trim()),
+  complete: (d, p) => d.completions.some((c) => c.id === p.cid),
+  skip: (d, p) => d.completions.some((c) => c.id === p.cid),
+  bulkComplete: (d, p) => (p.items || []).every((x) => d.completions.some((c) => c.id === x.cid)),
+  deleteItem: (d, p) => !d.items.some((i) => i.id === p.id),
+  deleteCompletion: (d, p) => !d.completions.some((c) => c.id === p.id),
+  archiveItem: (d, p) => d.items.some((i) => i.id === p.id && i.status === 'archived'),
+  restoreItem: (d, p) => d.items.some((i) => i.id === p.id && i.status === 'active'),
+  book: (d, p) => d.items.some((i) => i.id === p.id && i.stage === 'booked' && i.apptDate === p.apptDate),
+  unbook: (d, p) => d.items.some((i) => i.id === p.id && i.stage !== 'booked'),
+  inviteUser: (d, p) => d.users.some((u) => u.email === String(p.email).toLowerCase()),
+};
+
+/* ================= Instant changes: show now, save in the background ================= */
+function rebuild() {
+  if (!S.server) return;
+  const d = clone(S.server);
+  const by = d.me.email;
+  S.queue.forEach((op) => { try { APPLY[op.action](d, op.payload, by); } catch (e) { console.warn('apply failed', op, e); } });
   S.data = d;
-  S.fromLocal = fromLocal;
-  if (!fromLocal) { S.syncedAt = Date.now(); saveLocal(d); }
   if (!S.cal.cursor) { S.cal.cursor = today(); S.cal.selected = today(); }
   if (!S.bills.cursor) S.bills.cursor = today();
   S.picked.forEach((id) => { const i = itemById(id); if (!i || !canComplete(i)) S.picked.delete(id); });
   render();
 }
+
+function setServerData(d, fromLocal = false) {
+  S.server = d;
+  S.fromLocal = fromLocal;
+  if (!fromLocal) { S.syncedAt = Date.now(); saveLocal(d); }
+  rebuild();
+}
+
+/** Apply a change on screen immediately and queue it for the server. */
+function enqueue(action, payload, doneMsg) {
+  S.queue.push({ qid: rid('q'), action, payload });
+  persistQueue();
+  rebuild();
+  if (doneMsg) toast(doneMsg);
+  pump();
+}
+
+let pumping = false;
+async function pump() {
+  if (pumping || !S.server) return;
+  pumping = true;
+  setBusy(1);
+  try {
+    while (S.queue.length) {
+      const op = S.queue[0];
+      const res = await sendOp(op);
+      if (!res.ok && res.err.code === 'AUTH') { handleErr(res.err); return; } // keep the queue; resume after sign-in
+      S.queue.shift();
+      persistQueue();
+      if (res.data) setServerData(res.data); else rebuild();
+      if (!res.ok) toast(`Couldn't save that change: ${res.err.message}`, true);
+    }
+  } finally {
+    pumping = false;
+    setBusy(-1);
+    if (S.tab === 'more') render();
+  }
+}
+
+async function sendOp(op) {
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return { ok: true, data: await api(op.action, op.payload) };
+    } catch (e) {
+      lastErr = e;
+      if (!UNKNOWN_OUTCOME.has(e.code)) return { ok: false, err: e };
+      // The outcome is unknown. Check whether the change landed before trying again.
+      try {
+        const d = await api('bootstrap');
+        if (LANDED[op.action] && LANDED[op.action](d, op.payload)) return { ok: true, data: d };
+      } catch (e2) {
+        if (e2.code === 'AUTH') return { ok: false, err: e2 };
+      }
+      await sleep(1500 * (attempt + 1));
+    }
+  }
+  return { ok: false, err: lastErr };
+}
+
+window.addEventListener('beforeunload', (e) => {
+  if (S.queue.length) { e.preventDefault(); e.returnValue = ''; }
+});
 
 function handleErr(e) {
   if (e.code === 'AUTH') { signOut(e.message, { keepLocal: true }); return; }
@@ -306,9 +515,9 @@ function handleErr(e) {
 }
 
 function setBusy(delta) {
+  // Only the thin top bar: buttons stay usable because changes queue up and save in order.
   S.busy = Math.max(0, S.busy + delta);
   $('#busy').hidden = S.busy === 0;
-  document.querySelectorAll('.sheet button[type=submit], .sheet [data-busy]').forEach((b) => { b.disabled = S.busy > 0; });
 }
 
 let toastTimer;
@@ -391,8 +600,8 @@ function showSignIn(msg) {
 /** keepLocal: an expired sign-in keeps the saved copy so the next sign-in opens instantly. */
 function signOut(msg, opts = {}) {
   store.del('hb_token');
-  if (!opts.keepLocal) store.del(LOCAL_DATA_KEY);
-  S.token = null; S.claims = null; S.data = null; S.fromLocal = false;
+  if (!opts.keepLocal) { store.del(LOCAL_DATA_KEY); store.del(QUEUE_KEY); S.queue = []; }
+  S.token = null; S.claims = null; S.data = null; S.server = null; S.fromLocal = false;
   closeAllSheets();
   if (window.google && google.accounts && google.accounts.id && !opts.keepLocal) google.accounts.id.disableAutoSelect();
   showSignIn(msg);
@@ -425,10 +634,12 @@ function boot() {
 async function load() {
   $('#signin').hidden = true;
   $('#app').hidden = false;
-  if (!S.data) {
-    const local = S.claims && loadLocal(S.claims.email);
+  if (!S.server) {
+    const email = S.claims && S.claims.email;
+    S.queue = loadQueue(email);
+    const local = loadLocal(email);
     if (local) {
-      setData(local.data, true);
+      setServerData(local.data, true);
       S.syncedAt = local.savedAt;
       openFromHashOnce();
     } else {
@@ -439,10 +650,13 @@ async function load() {
 }
 
 async function refresh() {
-  const hadData = !!S.data;
+  // Changes waiting to save come back with fresh data anyway, so send those instead.
+  if (S.queue.length && S.server) { pump(); return; }
+  const hadData = !!S.server;
   try {
-    setData(await api('bootstrap', {}, { retry: true }));
+    setServerData(await api('bootstrap', {}, { retry: true }));
     openFromHashOnce();
+    if (S.queue.length) pump();
   } catch (e) {
     if (e.code === 'AUTH' || e.code === 'NOT_INVITED') { handleErr(e); return; }
     if (hadData) {
@@ -690,13 +904,17 @@ function renderBills() {
 
 /* ----- More ----- */
 function syncLine() {
-  if (!S.syncedAt) return '';
-  let line = `${S.fromLocal ? 'Showing saved data from' : 'Last updated'} ${fmtClock(S.syncedAt)}`;
+  const parts = [];
+  if (S.queue.length) parts.push(`${S.queue.length} change${S.queue.length === 1 ? '' : 's'} still saving`);
+  if (S.syncedAt) parts.push(`${S.fromLocal ? 'Showing saved data from' : 'Last updated'} ${fmtClock(S.syncedAt)}`);
   const t = S.timing;
   if (t && t.server) {
-    line += `. Last request: ${(t.totalMs / 1000).toFixed(1)}s total, ${(t.server.total / 1000).toFixed(1)}s on the server, cache ${t.server.cache}`;
+    parts.push(`Last request: ${(t.totalMs / 1000).toFixed(1)}s total, ${(t.server.total / 1000).toFixed(1)}s on the server, cache ${t.server.cache}`);
   }
-  return `<small>${esc(line)}.</small>`;
+  if (!S.badReply) { try { S.badReply = JSON.parse(store.get(BAD_REPLY_KEY) || 'null'); } catch (e) { S.badReply = null; } }
+  const b = S.badReply;
+  const bad = b ? `<small>Last unreadable reply (${esc(fmtClock(b.at))}, ${esc(b.action)}): HTTP ${esc(b.status)} from ${esc(b.host)}${b.redirected ? ' after a redirect' : ''}. Starts with: <code>${esc(b.snippet || '(empty)')}</code></small>` : '';
+  return `${parts.length ? `<small>${esc(parts.join('. '))}.</small>` : ''}${bad}`;
 }
 
 function renderMore() {
@@ -797,7 +1015,7 @@ const HELP_HTML = `
   <p>Archiving hides an item without losing its history. Restore it anytime from the Archive below. Only the admin can delete permanently.</p>
 </div></details>
 <details><summary>Why the list sometimes updates a moment after opening</summary><div class="answer">
-  <p>Homebase shows the copy saved on this phone right away, then checks for changes from the rest of the family. The thin bar at the top means it's checking. Signing out removes the saved copy from this phone.</p>
+  <p>Homebase shows the copy saved on this phone right away, then checks for changes from the rest of the family. Your own changes appear immediately and save in the background. The thin bar at the top means it's working. If you close the app before a change finishes saving, it continues the next time you open Homebase. Signing out removes the saved copy from this phone.</p>
 </div></details>
 <details><summary>Google Calendar</summary><div class="answer">
   <p class="soon">Calendar sync arrives in the next update.</p>
@@ -824,7 +1042,6 @@ function openSheet(html, opts = {}) {
   el.addEventListener('click', (ev) => { if (ev.target === el) closeSheet(); });
   requestAnimationFrame(() => el.classList.add('in'));
   if (opts.onMount) opts.onMount(el);
-  setBusy(0); // apply the current busy state to the new sheet's buttons
   return el;
 }
 
@@ -935,7 +1152,7 @@ function openComplete(i) {
   const users = activeUsers();
   const afterNote = i.recurMode === 'after' ? `<p class="hint">The next one will be due ${i.afterDays} days after this date.</p>` : '';
   const html = `${sheetHead(isBill ? 'Mark paid' : 'Mark done')}
-    <form id="complete-form" class="sheet-body form" data-id="${i.id}" novalidate>
+    <form id="complete-form" class="sheet-body form" data-id="${i.id}" data-cid="${rid('c')}" novalidate>
       <p style="margin:0;font-weight:600">${esc(i.title)}</p>
       ${isBill ? `<label class="field"><span>Amount paid (₱)</span><input name="amount" type="number" inputmode="decimal" step="0.01" min="0" value="${esc(i.amount || '')}"></label>
         <label class="field"><span>Paid by</span><select name="paidBy">${users.map((u) => `<option value="${esc(u.email)}"${u.email === me() ? ' selected' : ''}>${esc(displayName(u.email))}</option>`).join('')}</select></label>` : ''}
@@ -1003,7 +1220,7 @@ function openForm(type, it) {
       </div>
     </fieldset>
     <label class="field" data-show="flow:two"><span>Remind me to book</span>
-      <span class="inline"><input name="leadDays" type="number" inputmode="numeric" min="0" value="${esc(e.leadDays || '14')}"> days before it's due</span></label>`;
+      <span class="inline"><input class="num" name="leadDays" type="number" inputmode="numeric" min="0" value="${esc(e.leadDays || '14')}"> days before it's due</span></label>`;
 
   const recurFields = type === 'event' ? '' : `
     <fieldset class="field"><legend>Repeats</legend>
@@ -1014,12 +1231,12 @@ function openForm(type, it) {
       </div>
     </fieldset>
     <div class="field" data-show="recurMode:fixed">
-      <span class="inline">Every <input name="interval" type="number" inputmode="numeric" min="1" value="${esc(e.interval || '1')}" aria-label="Interval">
+      <span class="inline">Every <input class="num" name="interval" type="number" inputmode="numeric" min="1" value="${esc(e.interval || '1')}" aria-label="Interval">
         <select name="freq" aria-label="Unit">${Object.entries(FREQ).map(([k, u]) => `<option value="${k}"${(e.freq || 'monthly') === k ? ' selected' : ''}>${u[1]}</option>`).join('')}</select></span>
       <span class="hint">Keeps the same day each time, even if it's done late.</span>
     </div>
     <div class="field" data-show="recurMode:after">
-      <span class="inline"><input name="afterDays" type="number" inputmode="numeric" min="1" value="${esc(e.afterDays || '90')}" aria-label="Days"> days after it's done</span>
+      <span class="inline"><input class="num" name="afterDays" type="number" inputmode="numeric" min="1" value="${esc(e.afterDays || '90')}" aria-label="Days"> days after it's done</span>
       <span class="hint">The next date counts from the day you mark it done.</span>
     </div>`;
 
@@ -1031,7 +1248,7 @@ function openForm(type, it) {
   const people = activeUsers().map((u) => `<label class="chip"><input type="checkbox" name="assignees" value="${esc(u.email)}"${assigned.has(u.email) ? ' checked' : ''}><span>${esc(displayName(u.email))}</span></label>`).join('');
 
   const html = `${sheetHead(`${it ? 'Edit' : 'New'} ${TYPES[type].label.toLowerCase()}`, '<button class="btn sm primary" type="submit" form="item-form">Save</button>')}
-    <form id="item-form" class="sheet-body form t-${type}" data-type="${type}" data-id="${esc(e.id || '')}" novalidate>
+    <form id="item-form" class="sheet-body form t-${type}" data-type="${type}" data-id="${esc(e.id || '')}" data-new-id="${rid('i')}" novalidate>
       <label class="field"><span>Title</span><input name="title" required autocomplete="off" value="${esc(e.title || '')}" placeholder="${esc(placeholders[type])}"></label>
       ${eventFields}${flowFields}${dueFields}${billFields}${recurFields}
       <fieldset class="field"><legend>${type === 'event' ? 'Who gets reminded' : 'Assigned to'}</legend><div class="chips">${people}</div>
@@ -1083,7 +1300,9 @@ document.addEventListener('click', async (ev) => {
     case 'bulk-done': {
       const n = S.picked.size;
       if (!n || !confirm(`Mark ${n} item${n === 1 ? '' : 's'} done for today? Bills are logged at their usual amount.`)) break;
-      if (await mutate('bulkComplete', { ids: [...S.picked] }, `Marked ${n} done`)) { S.selecting = false; S.picked.clear(); render(); }
+      const entries = [...S.picked].map((id) => ({ id, cid: rid('c') }));
+      S.selecting = false; S.picked.clear();
+      enqueue('bulkComplete', { items: entries }, `Marked ${n} done`);
       break;
     }
 
@@ -1119,42 +1338,45 @@ document.addEventListener('click', async (ev) => {
     case 'done': openComplete(itemById(sheetItemId)); break;
     case 'book': openBook(itemById(sheetItemId)); break;
     case 'unbook':
-      if (await mutate('unbook', { id: sheetItemId }, 'Booking cleared')) { closeAllSheets(); }
+      closeAllSheets(); enqueue('unbook', { id: sheetItemId }, 'Booking cleared');
       break;
     case 'skip':
       if (!confirm('Skip this one? It moves to the next due date without logging it as done.')) break;
-      if (await mutate('skip', { id: sheetItemId }, 'Skipped')) closeAllSheets();
+      closeAllSheets(); enqueue('skip', { id: sheetItemId, cid: rid('c') }, 'Skipped');
       break;
     case 'archive':
-      if (await mutate('archiveItem', { id: sheetItemId }, 'Archived')) closeAllSheets();
+      closeAllSheets(); enqueue('archiveItem', { id: sheetItemId }, 'Archived');
       break;
     case 'restore':
-      if (await mutate('restoreItem', { id: a.dataset.id }, 'Restored')) closeAllSheets();
+      closeAllSheets(); enqueue('restoreItem', { id: a.dataset.id }, 'Restored');
       break;
     case 'purge':
       if (!confirm('Delete this item permanently? Its history stays in the spreadsheet, but the item is gone.')) break;
-      await mutate('deleteItem', { id: a.dataset.id }, 'Deleted');
+      enqueue('deleteItem', { id: a.dataset.id }, 'Deleted');
       break;
     case 'del-comp':
       if (!confirm('Remove this record? The next due date will not change.')) break;
-      if (await mutate('deleteCompletion', { id: a.dataset.cid }, 'Record removed')) { closeAllSheets(); if (sheetItemId) openDetail(sheetItemId); }
+      enqueue('deleteCompletion', { id: a.dataset.cid }, 'Record removed');
+      closeAllSheets(); if (sheetItemId) openDetail(sheetItemId);
       break;
 
     case 'theme': store.set('hb_theme', v); applyTheme(); render(); break;
-    case 'signout': signOut(); break;
+    case 'signout':
+      if (S.queue.length && !confirm(`${S.queue.length} change${S.queue.length === 1 ? " hasn't" : "s haven't"} saved yet and will be lost. Sign out anyway?`)) break;
+      signOut(); break;
     case 'cat-del':
       if (!confirm(`Remove the "${v}" category? Past payments keep it.`)) break;
-      await mutate('saveCategories', { categories: S.data.categories.filter((c) => c !== v) }, 'Category removed');
+      enqueue('saveCategories', { categories: S.data.categories.filter((c) => c !== v) }, 'Category removed');
       break;
     case 'user-reinvite':
-      await mutate('inviteUser', {
+      enqueue('inviteUser', {
         email: a.dataset.email, resend: true,
         role: (S.data.users.find((u) => u.email === a.dataset.email) || {}).role,
-      }, 'Invite sent');
+      }, 'Sending invite');
       break;
     case 'user-remove':
       if (!confirm(`Remove ${displayName(a.dataset.email)}? They won't be able to sign in.`)) break;
-      await mutate('removeUser', { email: a.dataset.email }, 'Member removed');
+      enqueue('removeUser', { email: a.dataset.email }, 'Member removed');
       break;
     default: break;
   }
@@ -1163,7 +1385,7 @@ document.addEventListener('click', async (ev) => {
 document.addEventListener('change', async (ev) => {
   const s = ev.target.closest('select[data-act="user-role"]');
   if (!s) return;
-  if (!(await mutate('updateUser', { email: s.dataset.email, role: s.value }, 'Role updated'))) render();
+  enqueue('updateUser', { email: s.dataset.email, role: s.value }, 'Role updated');
 });
 
 document.addEventListener('submit', async (ev) => {
@@ -1176,36 +1398,45 @@ document.addEventListener('submit', async (ev) => {
     const item = { type };
     for (const [k, val] of fd.entries()) if (k !== 'assignees') item[k] = String(val).trim();
     item.assignees = fd.getAll('assignees').join(',');
-    if (f.dataset.id) item.id = f.dataset.id;
+    item.id = f.dataset.id || f.dataset.newId;
     if (type === 'event') item.showYears = fd.get('showYears') ? 'yes' : 'no';
     if (!item.title) { toast('Give it a title.', true); f.elements.title.focus(); return; }
     if (type === 'event' ? !item.eventDate : !item.dueDate) { toast('Pick a date.', true); return; }
     if (item.recurMode === 'after' && !(Number(item.afterDays) >= 1)) { toast('Enter how many days after it is done.', true); return; }
-    if (await mutate('saveItem', { item }, item.id ? 'Changes saved' : `${TYPES[type].label} added`)) closeAllSheets();
+    if (item.amount && isNaN(Number(item.amount))) { toast('The amount should be a number.', true); return; }
+    closeAllSheets();
+    enqueue('saveItem', { item }, f.dataset.id ? 'Changes saved' : `${TYPES[type].label} added`);
   }
 
   if (f.id === 'complete-form') {
     const i = itemById(f.dataset.id);
-    const payload = { id: f.dataset.id, doneDate: fd.get('doneDate'), note: fd.get('note') || '' };
-    if (i.type === 'bill') { payload.amount = fd.get('amount'); payload.paidBy = fd.get('paidBy'); }
-    if (await mutate('complete', payload, i.type === 'bill' ? 'Marked paid' : 'Marked done')) closeAllSheets();
+    const payload = { id: f.dataset.id, cid: f.dataset.cid, doneDate: fd.get('doneDate') || today(), note: fd.get('note') || '' };
+    if (i.type === 'bill') {
+      payload.amount = fd.get('amount'); payload.paidBy = fd.get('paidBy');
+      if (payload.amount && isNaN(Number(payload.amount))) { toast('The amount should be a number.', true); return; }
+    }
+    closeAllSheets();
+    enqueue('complete', payload, i.type === 'bill' ? 'Marked paid' : 'Marked done');
   }
 
   if (f.id === 'book-form') {
     if (!fd.get('apptDate')) { toast('Pick the appointment date.', true); return; }
-    if (await mutate('book', { id: f.dataset.id, apptDate: fd.get('apptDate'), apptTime: fd.get('apptTime') }, 'Marked booked')) closeAllSheets();
+    closeAllSheets();
+    enqueue('book', { id: f.dataset.id, apptDate: fd.get('apptDate'), apptTime: fd.get('apptTime') || '' }, 'Marked booked');
   }
 
   if (f.id === 'invite-form') {
     const email = String(fd.get('email') || '').trim();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { toast('Enter a valid email address.', true); return; }
-    if (await mutate('inviteUser', { email, name: fd.get('name'), role: fd.get('role') }, 'Invite sent')) f.reset();
+    enqueue('inviteUser', { email, name: String(fd.get('name') || '').trim(), role: fd.get('role') }, 'Sending invite');
+    f.reset();
   }
 
   if (f.id === 'cat-form') {
     const cat = String(fd.get('cat') || '').trim();
     if (!cat) return;
-    await mutate('saveCategories', { categories: [...S.data.categories, cat] }, 'Category added');
+    if (S.data.categories.some((c) => c.toLowerCase() === cat.toLowerCase())) { toast('That category already exists.', true); return; }
+    enqueue('saveCategories', { categories: [...S.data.categories, cat] }, 'Category added');
   }
 });
 
