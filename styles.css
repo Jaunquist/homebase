@@ -1,4 +1,4 @@
-/* Homebase styles, Phase 1 */
+/* Homebase styles, Phase 1.2 */
 
 :root {
   --bg: #EDF0EE;
@@ -313,6 +313,7 @@ svg .fill { fill: currentColor; stroke: none; }
 .field .hint { font-size: 14px; color: var(--muted); }
 .inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .inline input[type=number] { width: 84px; flex: none; }
+.field .inline input.num { width: 84px; flex: none; } /* beats the full-width field rule above */
 .inline select { width: auto; flex: 1; }
 .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .check { display: flex; align-items: center; gap: 10px; font-weight: 400; }
@@ -367,6 +368,7 @@ svg .fill { fill: currentColor; stroke: none; }
 .member:first-of-type { border-top: 0; }
 .member .who-info { flex: 1; min-width: 0; }
 .member .who-info small { display: block; color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
+.member .who-info code { font-size: 12px; word-break: break-all; background: var(--sunk); padding: 1px 4px; border-radius: 4px; }
 .member select { min-height: 36px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface); padding: 0 8px; }
 .badge { display: inline-block; font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 999px; background: var(--sunk); color: var(--muted); margin-left: 6px; vertical-align: 1px; }
 .help details { border-top: 1px solid var(--line); }
