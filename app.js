@@ -1,4 +1,4 @@
-/* Homebase front end (app.js), Phase 1.2 (instant, safe-to-repeat saves) */
+/* Homebase front end (app.js), Phase 1.3 (install banner) */
 'use strict';
 
 /* ================= Config comes from config.js ================= */
@@ -694,6 +694,42 @@ function applyTheme() {
 }
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
 
+/* ================= Install as an app ================= */
+let installPrompt = null; // Chrome's install event, kept until the user taps Install
+
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault(); // we show our own button instead of Chrome's mini bar
+  installPrompt = e;
+  render();
+});
+window.addEventListener('appinstalled', () => {
+  installPrompt = null;
+  toast('Homebase installed. Open it from your home screen.');
+  render();
+});
+
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const canInstall = () => !isStandalone() && (installPrompt || isIOS());
+
+function installBannerHTML() {
+  if (!canInstall() || store.get('hb_install_hidden')) return '';
+  const body = installPrompt
+    ? `<div class="ib-text"><b>Install Homebase</b><span>Open it from your home screen like an app.</span></div>
+       <button class="btn sm primary" data-act="install">Install</button>`
+    : `<div class="ib-text"><b>Add Homebase to your Home Screen</b><span>In Safari, tap Share, then <b>Add to Home Screen</b>.</span></div>`;
+  return `<div class="install-banner" role="region" aria-label="Install Homebase">${body}
+    <button class="icon" data-act="install-hide" aria-label="Hide this">${ICON.x}</button></div>`;
+}
+
+function installRowHTML() {
+  if (!canInstall()) return '';
+  return `<div class="member"><div class="who-info">Install app<small>${installPrompt
+    ? 'Add Homebase to this phone so it opens like an app.'
+    : 'In Safari, tap Share, then Add to Home Screen.'}</small></div>
+    ${installPrompt ? '<button class="btn sm" data-act="install">Install</button>' : ''}</div>`;
+}
+
 /* ================= Render ================= */
 function render() {
   if (!S.data) return;
@@ -760,7 +796,7 @@ function renderUpcoming() {
         <div class="list">${list.map(rowHTML).join('')}</div>`).join('')
     : `<div class="empty"><strong>${S.who === 'mine' || S.typeFilter !== 'all' ? 'Nothing matches these filters' : 'Nothing scheduled yet'}</strong>
         Tap + to add upkeep, a bill, a family date or a task.</div>`;
-  return `<div class="head-row"><h2 class="h">Upcoming</h2>${selectBtn}</div>${filtersHTML()}${body}`;
+  return `${installBannerHTML()}<div class="head-row"><h2 class="h">Upcoming</h2>${selectBtn}</div>${filtersHTML()}${body}`;
 }
 
 function renderSelectBar() {
@@ -986,6 +1022,7 @@ function renderMore() {
       <h2>Account</h2>
       <div class="member">${avatar(me())}<div class="who-info">${esc(S.data.me.name)}<small>${esc(me())}</small></div>
         <button class="btn sm" data-act="signout">Sign out</button></div>
+      ${installRowHTML()}
       <div class="member"><div class="who-info">Sync${syncLine()}</div>
         <button class="btn sm" data-act="reload" data-busy>Refresh</button></div>
     </section>`;
@@ -1278,6 +1315,24 @@ document.addEventListener('click', async (ev) => {
 
   switch (act) {
     case 'close': closeSheet(); break;
+    case 'install': {
+      if (!installPrompt) break;
+      const p = installPrompt;
+      installPrompt = null;
+      try {
+        p.prompt(); // must run straight from the tap; each install event can only be used once
+        const choice = await p.userChoice;
+        if (choice.outcome !== 'accepted') toast('Not installed. Chrome will offer it again later.');
+      } catch (e) {
+        toast("Couldn't open the install dialog. Use Chrome's menu, then Install app.", true);
+      }
+      render();
+      break;
+    }
+    case 'install-hide':
+      store.set('hb_install_hidden', '1');
+      toast('Hidden. You can still install from More.');
+      render(); break;
     case 'reload': if (S.data) refresh(); else load(); break;
     case 'tab':
       S.tab = a.dataset.tab;
