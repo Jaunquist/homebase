@@ -1,4 +1,4 @@
-/* Homebase front end (app.js), Phase 1.3 (install banner) */
+/* Homebase front end (app.js), Phase 2 (Calendar sync, status panel, undo) */
 'use strict';
 
 /* ================= Config comes from config.js ================= */
@@ -138,6 +138,7 @@ const activeUsers = () => S.data.users.filter((u) => u.status !== 'removed')
   .sort((a, b) => displayName(a.email).localeCompare(displayName(b.email)));
 
 function displayName(email) {
+  if (email === 'calendar') return 'Google Calendar';
   const u = S.data.users.find((x) => x.email === email);
   return (u && u.name) || String(email).split('@')[0];
 }
@@ -348,6 +349,10 @@ function normalizeItem(input) {
   return c;
 }
 
+function snapshot(it) {
+  return JSON.stringify({ dueDate: it.dueDate, stage: it.stage, apptDate: it.apptDate, apptTime: it.apptTime, status: it.status });
+}
+
 function advanceLocal(it, fromDate, by) {
   if (it.recurMode === 'fixed') it.dueDate = nextFixed(it.dueDate, it.freq, it.interval, it.anchorDay);
   else if (it.recurMode === 'after') it.dueDate = addDays(fromDate, Number(it.afterDays) || 1);
@@ -388,7 +393,7 @@ const APPLY = {
       id: p.cid, itemId: it.id, itemTitle: it.title, type: it.type, category: isBill ? it.category : '', kind: 'done',
       dueDate: it.stage === 'booked' && it.apptDate ? it.apptDate : it.dueDate, doneDate,
       amount: isBill ? String(p.amount !== undefined && p.amount !== '' ? p.amount : (it.amount || '')) : '',
-      paidBy: isBill ? String(p.paidBy || by).toLowerCase() : '', note: p.note || '', by, at: nowIso(),
+      paidBy: isBill ? String(p.paidBy || by).toLowerCase() : '', note: p.note || '', by, at: nowIso(), prev: snapshot(it),
     });
     advanceLocal(it, doneDate, by);
   },
@@ -399,13 +404,25 @@ const APPLY = {
     if (!it || it.status !== 'active' || it.recurMode === 'none') return;
     d.completions.push({
       id: p.cid, itemId: it.id, itemTitle: it.title, type: it.type, category: it.type === 'bill' ? it.category : '',
-      kind: 'skipped', dueDate: it.dueDate, doneDate: today(), amount: '', paidBy: '', note: '', by, at: nowIso(),
+      kind: 'skipped', dueDate: it.dueDate, doneDate: today(), amount: '', paidBy: '', note: '', by, at: nowIso(), prev: snapshot(it),
     });
     advanceLocal(it, it.dueDate, by);
   },
   book(d, p, by) { const it = d.items.find((i) => i.id === p.id); if (it) Object.assign(it, { stage: 'booked', apptDate: p.apptDate, apptTime: p.apptTime || '', updatedBy: by, updatedAt: nowIso() }); },
   unbook(d, p, by) { const it = d.items.find((i) => i.id === p.id); if (it) Object.assign(it, { stage: 'to_book', apptDate: '', apptTime: '', updatedBy: by, updatedAt: nowIso() }); },
   deleteCompletion(d, p) { d.completions = d.completions.filter((c) => c.id !== p.id); },
+  undoCompletion(d, p, by) {
+    const c = d.completions.find((x) => x.id === p.id);
+    if (!c) return;
+    const it = d.items.find((i) => i.id === c.itemId);
+    let prev = null;
+    try { prev = c.prev ? JSON.parse(c.prev) : null; } catch (e) { prev = null; }
+    if (it && prev) {
+      ['dueDate', 'stage', 'apptDate', 'apptTime', 'status'].forEach((k) => { if (prev[k] !== undefined) it[k] = prev[k]; });
+      it.updatedBy = by; it.updatedAt = nowIso();
+    }
+    d.completions = d.completions.filter((x) => x.id !== p.id);
+  },
   saveCategories(d, p) { d.categories = p.categories.slice(); },
   inviteUser(d, p) {
     const email = String(p.email).toLowerCase();
@@ -425,6 +442,7 @@ const LANDED = {
   bulkComplete: (d, p) => (p.items || []).every((x) => d.completions.some((c) => c.id === x.cid)),
   deleteItem: (d, p) => !d.items.some((i) => i.id === p.id),
   deleteCompletion: (d, p) => !d.completions.some((c) => c.id === p.id),
+  undoCompletion: (d, p) => !d.completions.some((c) => c.id === p.id),
   archiveItem: (d, p) => d.items.some((i) => i.id === p.id && i.status === 'archived'),
   restoreItem: (d, p) => d.items.some((i) => i.id === p.id && i.status === 'active'),
   book: (d, p) => d.items.some((i) => i.id === p.id && i.stage === 'booked' && i.apptDate === p.apptDate),
@@ -453,11 +471,11 @@ function setServerData(d, fromLocal = false) {
 }
 
 /** Apply a change on screen immediately and queue it for the server. */
-function enqueue(action, payload, doneMsg) {
+function enqueue(action, payload, doneMsg, undo) {
   S.queue.push({ qid: rid('q'), action, payload });
   persistQueue();
   rebuild();
-  if (doneMsg) toast(doneMsg);
+  if (doneMsg) toast(doneMsg, false, undo ? { label: 'Undo', fn: undo } : null);
   pump();
 }
 
@@ -521,13 +539,16 @@ function setBusy(delta) {
 }
 
 let toastTimer;
-function toast(msg, isErr) {
+let toastAction = null;
+function toast(msg, isErr, action) {
   const el = $('#toast');
-  el.textContent = msg;
+  toastAction = action || null;
+  el.innerHTML = `<span>${esc(msg)}</span>${action ? `<button class="toast-btn" data-act="toast-action">${esc(action.label)}</button>` : ''}`;
   el.classList.toggle('err', !!isErr);
+  el.classList.toggle('has-action', !!action);
   el.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), isErr ? 5000 : 2600);
+  toastTimer = setTimeout(() => { el.classList.remove('show'); toastAction = null; }, isErr ? 5000 : action ? 6000 : 2600);
 }
 
 /* ================= Auth (Google Identity Services) ================= */
@@ -943,6 +964,7 @@ function syncLine() {
   const parts = [];
   if (S.queue.length) parts.push(`${S.queue.length} change${S.queue.length === 1 ? '' : 's'} still saving`);
   if (S.syncedAt) parts.push(`${S.fromLocal ? 'Showing saved data from' : 'Last updated'} ${fmtClock(S.syncedAt)}`);
+  parts.push(S.data && S.data.calendar ? 'Google Calendar sync is on' : 'Google Calendar sync is off');
   const t = S.timing;
   if (t && t.server) {
     parts.push(`Last request: ${(t.totalMs / 1000).toFixed(1)}s total, ${(t.server.total / 1000).toFixed(1)}s on the server, cache ${t.server.cache}`);
@@ -1041,12 +1063,12 @@ const HELP_HTML = `
 </div></details>
 <details><summary>Upkeep that needs a vendor booking</summary><div class="answer">
   <p>Choose <b>Book a vendor first</b> when adding upkeep. Homebase reminds you to book a set number of days before the service is due.</p>
-  <ol><li>When you've booked, tap <b>Mark booked</b> and enter the appointment date.</li>
-  <li>After the job, tap <b>Mark done</b>. The date you enter sets when the next one is due.</li></ol>
+  <ol><li>When you've booked, tap <b>I've booked it</b> and enter the appointment date.</li>
+  <li>After the job, tap <b>It's done</b>. The date you enter sets when the next one is due.</li></ol>
 </div></details>
-<details><summary>Who can tick things off</summary><div class="answer">
+<details><summary>Who can tick things off, and undoing</summary><div class="answer">
   <p>Anyone assigned to an item can mark it done. If nobody is assigned, anyone can. The admin can tick off any item, and can use <b>Select</b> in Upcoming to mark several done at once.</p>
-  <p>Marked something by mistake? Open the item and remove the record from its history. The next due date stays where it moved to, so adjust it with <b>Edit</b> if needed.</p>
+  <p>Marked something by mistake? Tap <b>Undo</b> in the message that appears, or open the item and tap <b>Undo</b> (or <b>Mark unpaid</b> for a bill) on the newest record in its history. The item goes back exactly as it was, including its due date and booking.</p>
 </div></details>
 <details><summary>Archiving and deleting</summary><div class="answer">
   <p>Archiving hides an item without losing its history. Restore it anytime from the Archive below. Only the admin can delete permanently.</p>
@@ -1055,9 +1077,11 @@ const HELP_HTML = `
   <p>Homebase shows the copy saved on this phone right away, then checks for changes from the rest of the family. Your own changes appear immediately and save in the background. The thin bar at the top means it's working. If you close the app before a change finishes saving, it continues the next time you open Homebase. Signing out removes the saved copy from this phone.</p>
 </div></details>
 <details><summary>Google Calendar</summary><div class="answer">
-  <p class="soon">Calendar sync arrives in the next update.</p>
-  <p>Each item will appear on the shared family calendar as one event with a link back here. To add something from Google Calendar, put <b>#home</b> in the event title.</p>
-  <p>Calendar reminders are personal, so each person turns them on once: on calendar.google.com, open the shared calendar's <b>Settings and sharing</b>, then add notifications under <b>Event notifications</b> and <b>All-day event notifications</b>.</p>
+  <p>Every item appears on the shared family calendar as one event at its next date, with a link back here. People assigned to an item are added as guests, so it also shows on their own calendar.</p>
+  <p><b>Changes in Calendar come back here:</b> drag an event to a new date to reschedule that one time, or edit its title or notes. Deleting an event skips that occurrence. Undo it from the item's history here. Birthdays and other yearly dates can't be moved from Calendar.</p>
+  <p><b>Adding from Calendar:</b> create an event with <b>#home</b> in the title, and it becomes a one-off task here, assigned to you.</p>
+  <p><b>Reminders are personal,</b> so each person turns them on once: on calendar.google.com, open the shared calendar's <b>Settings and sharing</b>, then add notifications under <b>Event notifications</b> and <b>All-day event notifications</b>.</p>
+  <p><b>Not seeing events on your own calendar?</b> In Google Calendar settings, under <b>Events from Gmail</b> and <b>Add invitations to my calendar</b>, choose an option that includes invitations from people you know.</p>
 </div></details>
 <details><summary>Phone alerts</summary><div class="answer">
   <p class="soon">Push alerts arrive in a later update.</p>
@@ -1101,25 +1125,50 @@ function sheetHead(title, right = '') {
 }
 
 /* ----- Detail ----- */
+
+/** Plain-language status for the top of an item: what state it's in right now. */
+function statusFor(i, v) {
+  if (i.status === 'done') return { label: 'Finished', detail: 'This one-off item is done.', tone: 'ok' };
+  if (i.status === 'archived') return { label: 'Archived', detail: 'Hidden from the schedule. Restore it to bring it back.', tone: '' };
+  const late = v.date < today() && i.type !== 'event';
+  const when = (d, t) => `${fmtLong(d)}${t ? ', ' + fmtTime(t) : ''} (${rel(d).toLowerCase()})`;
+  if (i.type === 'event') return { label: rel(v.date), detail: `${fmtLong(v.date)}${v.note ? '. ' + v.note : ''}`, tone: '' };
+  if (v.stage === 'to_book') {
+    return { label: late ? 'Not booked yet, overdue' : 'Not booked yet', detail: `Book by ${when(v.date)}. Service due ${fmtLong(i.dueDate)}.`, tone: late ? 'late' : '' };
+  }
+  if (v.stage === 'booked') {
+    return { label: 'Booked', detail: `${when(i.apptDate, i.apptTime)}${i.vendorName ? ' with ' + i.vendorName : ''}.`, tone: 'ok' };
+  }
+  if (i.type === 'bill') {
+    const last = S.data.completions.filter((c) => c.itemId === i.id && c.kind === 'done')
+      .sort((a, b) => b.doneDate.localeCompare(a.doneDate))[0];
+    const lastText = last ? ` Last paid ${fmtShort(last.doneDate)}${last.amount !== '' ? ', ' + peso(last.amount) : ''}.` : '';
+    return { label: late ? 'Not paid, overdue' : 'Not paid yet', detail: `Due ${when(i.dueDate)}.${lastText}`, tone: late ? 'late' : '' };
+  }
+  return { label: late ? 'Overdue' : 'To do', detail: `Due ${when(i.dueDate, i.dueTime)}.`, tone: late ? 'late' : '' };
+}
+
+/** The newest record for an item, which is the only one that can be undone. */
+function latestCompletion(itemId) {
+  // Newest by time; records saved in the same second fall back to the order they were saved.
+  return S.data.completions.filter((c) => c.itemId === itemId)
+    .reduce((best, x) => (!best || String(x.at) >= String(best.at) ? x : best), null);
+}
+function canUndo(c) {
+  const i = itemById(c.itemId);
+  const latest = latestCompletion(c.itemId);
+  if (!latest || latest.id !== c.id || !c.prev) return false;
+  return isAdmin() || c.by === me() || (!!i && (assignees(i).length === 0 || assignees(i).includes(me())));
+}
+
 function openDetail(id) {
   const i = itemById(id);
   if (!i) { toast('That item no longer exists.', true); return; }
-  const v = i.status === 'active' ? view(i) : null;
+  const v = view(i);
+  const st = statusFor(i, v);
   const facts = [];
 
-  if (i.type === 'event') {
-    const d = view(i).date;
-    facts.push(['Next', `${fmtLong(d)}${eventNote(i, d) ? ', ' + eventNote(i, d).toLowerCase() : ''}`]);
-    facts.push(['Original date', fmtLong(i.eventDate)]);
-  } else if (v && v.stage === 'to_book') {
-    facts.push(['Book by', `${fmtLong(v.date)} (${rel(v.date).toLowerCase()})`]);
-    facts.push(['Service due', fmtLong(i.dueDate)]);
-  } else if (v && v.stage === 'booked') {
-    facts.push(['Appointment', `${fmtLong(i.apptDate)}${i.apptTime ? ', ' + fmtTime(i.apptTime) : ''}`]);
-    facts.push(['Service due', fmtLong(i.dueDate)]);
-  } else if (i.dueDate) {
-    facts.push([i.status === 'active' ? 'Due' : 'Last due', `${fmtLong(i.dueDate)}${i.dueTime ? ', ' + fmtTime(i.dueTime) : ''}`]);
-  }
+  if (i.type === 'event') facts.push(['Original date', fmtLong(i.eventDate)]);
   facts.push(['Repeats', describeRecur(i)]);
   facts.push(['Assigned to', assignees(i).length ? assignees(i).map(displayName).map(esc).join(', ') : 'Anyone']);
   if (i.type === 'bill') {
@@ -1130,26 +1179,25 @@ function openDetail(id) {
     const tel = i.vendorPhone ? `<a href="tel:${esc(i.vendorPhone.replace(/[^\d+]/g, ''))}">${esc(i.vendorPhone)}</a>` : '';
     facts.push(['Vendor', [esc(i.vendorName), tel].filter(Boolean).join('<br>')]);
   }
-  if (i.status !== 'active') facts.push(['Status', i.status === 'done' ? 'Finished' : 'Archived']);
 
-  const can = canComplete(i);
+  // All actions share one neutral style; the status above says what state the item is in.
   const acts = [];
-  if (can) {
+  if (canComplete(i)) {
     if (v.stage === 'to_book') {
-      acts.push('<button class="btn primary" data-act="book" data-busy>Mark booked</button>');
-      acts.push('<button class="btn" data-act="done" data-busy>Mark done</button>');
+      acts.push('<button class="btn" data-act="book">I\'ve booked it</button>');
+      acts.push('<button class="btn" data-act="done">It\'s done</button>');
     } else if (v.stage === 'booked') {
-      acts.push('<button class="btn primary" data-act="done" data-busy>Mark done</button>');
-      acts.push('<button class="btn" data-act="book" data-busy>Change booking</button>');
-      acts.push('<button class="btn quiet" data-act="unbook" data-busy>Clear booking</button>');
+      acts.push('<button class="btn" data-act="done">It\'s done</button>');
+      acts.push('<button class="btn" data-act="book">Change booking</button>');
+      acts.push('<button class="btn" data-act="unbook">Not booked after all</button>');
     } else {
-      acts.push(`<button class="btn primary" data-act="done" data-busy>${i.type === 'bill' ? 'Mark paid' : 'Mark done'}</button>`);
+      acts.push(`<button class="btn" data-act="done">${i.type === 'bill' ? 'Mark paid' : 'It\'s done'}</button>`);
     }
-    if (i.recurMode !== 'none') acts.push('<button class="btn quiet" data-act="skip" data-busy>Skip this one</button>');
+    if (i.recurMode !== 'none') acts.push('<button class="btn quiet" data-act="skip">Skip this one</button>');
   }
 
   const hist = S.data.completions.filter((c) => c.itemId === id)
-    .sort((a, b) => b.doneDate.localeCompare(a.doneDate) || b.at.localeCompare(a.at));
+    .sort((a, b) => b.doneDate.localeCompare(a.doneDate) || String(b.at).localeCompare(String(a.at)));
   const paid = hist.filter((c) => c.kind === 'done' && c.amount !== '').slice(0, 12).reverse();
   let spark = '';
   if (i.type === 'bill' && paid.length >= 2) {
@@ -1163,21 +1211,27 @@ function openDetail(id) {
   const histHTML = hist.length ? `<h3 class="section-h">History</h3>${spark}<ul class="hist">${hist.map((c) => {
     const what = c.kind === 'skipped' ? 'Skipped'
       : c.amount !== '' ? `Paid ${peso(c.amount)}${c.paidBy ? ' by ' + esc(displayName(c.paidBy)) : ''}` : 'Done';
-    const canDel = isAdmin() || c.by === me();
-    return `<li><span class="what">${what}<small>${fmtLong(c.doneDate)}, logged by ${esc(displayName(c.by))}${c.note ? '. ' + esc(c.note) : ''}</small></span>
-      ${canDel ? `<button class="icon" data-act="del-comp" data-cid="${c.id}" aria-label="Remove this record" data-busy>${ICON.x}</button>` : ''}</li>`;
+    let btn = '';
+    if (canUndo(c)) {
+      const label = c.kind === 'done' && i.type === 'bill' ? 'Mark unpaid' : 'Undo';
+      btn = `<button class="btn sm quiet" data-act="undo-comp" data-cid="${c.id}">${label}</button>`;
+    } else if (isAdmin() || c.by === me()) {
+      btn = `<button class="icon" data-act="del-comp" data-cid="${c.id}" aria-label="Remove this record">${ICON.x}</button>`;
+    }
+    return `<li><span class="what">${what}<small>${fmtLong(c.doneDate)}, logged by ${esc(displayName(c.by))}${c.note ? '. ' + esc(c.note) : ''}</small></span>${btn}</li>`;
   }).join('')}</ul>` : '';
 
   const manage = i.status === 'active'
-    ? `<div class="actions" style="margin-top:18px"><button class="btn" data-act="edit">Edit</button><button class="btn quiet danger" data-act="archive" data-busy>Archive</button></div>`
-    : `<div class="actions" style="margin-top:18px"><button class="btn" data-act="restore" data-id="${i.id}" data-busy>${i.status === 'done' ? 'Reopen' : 'Restore'}</button></div>`;
+    ? `<div class="actions" style="margin-top:18px"><button class="btn" data-act="edit">Edit</button><button class="btn quiet danger" data-act="archive">Archive</button></div>`
+    : `<div class="actions" style="margin-top:18px"><button class="btn" data-act="restore" data-id="${i.id}">${i.status === 'done' ? 'Reopen' : 'Restore'}</button></div>`;
 
   openSheet(`${sheetHead(TYPES[i.type].label)}
     <div class="sheet-body t-${i.type}" data-item="${i.id}">
-      <div class="detail-title"><div><h3>${esc(i.title)}</h3>${v && v.note ? `<span class="kind">${esc(v.note)}</span>` : ''}</div></div>
-      <dl class="facts">${facts.map(([k, val]) => `<div><dt>${k}</dt><dd>${val}</dd></div>`).join('')}</dl>
-      ${i.notes ? `<p class="notes">${esc(i.notes)}</p>` : ''}
+      <div class="detail-title"><div><h3>${esc(i.title)}</h3></div></div>
+      <div class="status${st.tone ? ' ' + st.tone : ''}" role="status"><b>${esc(st.label)}</b><span>${esc(st.detail)}</span></div>
       ${acts.length ? `<div class="actions">${acts.join('')}</div>` : ''}
+      <dl class="facts" style="margin-top:18px">${facts.map(([k, val]) => `<div><dt>${k}</dt><dd>${val}</dd></div>`).join('')}</dl>
+      ${i.notes ? `<p class="notes">${esc(i.notes)}</p>` : ''}
       ${histHTML}
       ${manage}
     </div>`);
@@ -1188,28 +1242,28 @@ function openComplete(i) {
   const isBill = i.type === 'bill';
   const users = activeUsers();
   const afterNote = i.recurMode === 'after' ? `<p class="hint">The next one will be due ${i.afterDays} days after this date.</p>` : '';
-  const html = `${sheetHead(isBill ? 'Mark paid' : 'Mark done')}
+  const html = `${sheetHead(isBill ? 'Mark paid' : "It's done")}
     <form id="complete-form" class="sheet-body form" data-id="${i.id}" data-cid="${rid('c')}" novalidate>
       <p style="margin:0;font-weight:600">${esc(i.title)}</p>
       ${isBill ? `<label class="field"><span>Amount paid (₱)</span><input name="amount" type="number" inputmode="decimal" step="0.01" min="0" value="${esc(i.amount || '')}"></label>
         <label class="field"><span>Paid by</span><select name="paidBy">${users.map((u) => `<option value="${esc(u.email)}"${u.email === me() ? ' selected' : ''}>${esc(displayName(u.email))}</option>`).join('')}</select></label>` : ''}
       <label class="field"><span>${isBill ? 'Date paid' : 'Date done'}</span><input name="doneDate" type="date" required value="${today()}">${afterNote}</label>
       <label class="field"><span>Note (optional)</span><input name="note" autocomplete="off"></label>
-      <button class="btn primary" type="submit">${isBill ? 'Mark paid' : 'Mark done'}</button>
+      <button class="btn primary" type="submit">${isBill ? 'Mark paid' : 'Save'}</button>
     </form>`;
   openSheet(html, { small: true });
 }
 
 /* ----- Book ----- */
 function openBook(i) {
-  const html = `${sheetHead('Mark booked')}
+  const html = `${sheetHead(i.stage === 'booked' ? 'Change booking' : "I've booked it")}
     <form id="book-form" class="sheet-body form" data-id="${i.id}" novalidate>
       <p style="margin:0;font-weight:600">${esc(i.title)}</p>
       <div class="two-col">
         <label class="field"><span>Appointment date</span><input name="apptDate" type="date" required value="${esc(i.apptDate || i.dueDate)}"></label>
         <label class="field"><span>Time (optional)</span><input name="apptTime" type="time" value="${esc(i.apptTime || '')}"></label>
       </div>
-      <button class="btn primary" type="submit">Mark booked</button>
+      <button class="btn primary" type="submit">Save booking</button>
     </form>`;
   openSheet(html, { small: true });
 }
@@ -1315,6 +1369,22 @@ document.addEventListener('click', async (ev) => {
 
   switch (act) {
     case 'close': closeSheet(); break;
+    case 'toast-action': {
+      const fn = toastAction && toastAction.fn;
+      toastAction = null;
+      $('#toast').classList.remove('show');
+      if (fn) fn();
+      break;
+    }
+    case 'undo-comp': {
+      const c = S.data.completions.find((x) => x.id === a.dataset.cid);
+      if (!c) break;
+      const i = itemById(c.itemId);
+      const label = c.kind === 'done' && i && i.type === 'bill' ? 'Marked unpaid' : 'Undone';
+      enqueue('undoCompletion', { id: c.id }, label);
+      closeAllSheets(); if (i) openDetail(i.id);
+      break;
+    }
     case 'install': {
       if (!installPrompt) break;
       const p = installPrompt;
@@ -1392,16 +1462,26 @@ document.addEventListener('click', async (ev) => {
     case 'edit': openForm(null, itemById(sheetItemId)); break;
     case 'done': openComplete(itemById(sheetItemId)); break;
     case 'book': openBook(itemById(sheetItemId)); break;
-    case 'unbook':
-      closeAllSheets(); enqueue('unbook', { id: sheetItemId }, 'Booking cleared');
+    case 'unbook': {
+      const it = itemById(sheetItemId);
+      const prev = { id: it.id, apptDate: it.apptDate, apptTime: it.apptTime || '' };
+      closeAllSheets();
+      enqueue('unbook', { id: it.id }, 'Marked not booked', () => enqueue('book', prev, 'Booking restored'));
       break;
-    case 'skip':
+    }
+    case 'skip': {
       if (!confirm('Skip this one? It moves to the next due date without logging it as done.')) break;
-      closeAllSheets(); enqueue('skip', { id: sheetItemId, cid: rid('c') }, 'Skipped');
+      const cid = rid('c');
+      closeAllSheets();
+      enqueue('skip', { id: sheetItemId, cid }, 'Skipped', () => enqueue('undoCompletion', { id: cid }, 'Undone'));
       break;
-    case 'archive':
-      closeAllSheets(); enqueue('archiveItem', { id: sheetItemId }, 'Archived');
+    }
+    case 'archive': {
+      const id = sheetItemId;
+      closeAllSheets();
+      enqueue('archiveItem', { id }, 'Archived', () => enqueue('restoreItem', { id }, 'Restored'));
       break;
+    }
     case 'restore':
       closeAllSheets(); enqueue('restoreItem', { id: a.dataset.id }, 'Restored');
       break;
@@ -1471,13 +1551,18 @@ document.addEventListener('submit', async (ev) => {
       if (payload.amount && isNaN(Number(payload.amount))) { toast('The amount should be a number.', true); return; }
     }
     closeAllSheets();
-    enqueue('complete', payload, i.type === 'bill' ? 'Marked paid' : 'Marked done');
+    enqueue('complete', payload, i.type === 'bill' ? 'Marked paid' : 'Marked done',
+      () => enqueue('undoCompletion', { id: payload.cid }, i.type === 'bill' ? 'Marked unpaid' : 'Undone'));
   }
 
   if (f.id === 'book-form') {
     if (!fd.get('apptDate')) { toast('Pick the appointment date.', true); return; }
+    const it = itemById(f.dataset.id);
+    const wasBooked = it.stage === 'booked' && it.apptDate;
+    const prev = { id: it.id, apptDate: it.apptDate, apptTime: it.apptTime || '' };
     closeAllSheets();
-    enqueue('book', { id: f.dataset.id, apptDate: fd.get('apptDate'), apptTime: fd.get('apptTime') || '' }, 'Marked booked');
+    enqueue('book', { id: it.id, apptDate: fd.get('apptDate'), apptTime: fd.get('apptTime') || '' }, wasBooked ? 'Booking changed' : 'Marked booked',
+      () => (wasBooked ? enqueue('book', prev, 'Booking restored') : enqueue('unbook', { id: it.id }, 'Marked not booked')));
   }
 
   if (f.id === 'invite-form') {
