@@ -1,4 +1,4 @@
-/* Homebase front end (app.js), Phase 2 (Calendar sync, status panel, undo) */
+/* Homebase front end (app.js), Phase 2.1 (Calendar sync, status panel, undo) */
 'use strict';
 
 /* ================= Config comes from config.js ================= */
@@ -1080,7 +1080,8 @@ const HELP_HTML = `
   <p>Every item appears on the shared family calendar as one event at its next date, with a link back here. People assigned to an item are added as guests, so it also shows on their own calendar.</p>
   <p><b>Changes in Calendar come back here:</b> drag an event to a new date to reschedule that one time, or edit its title or notes. Deleting an event skips that occurrence. Undo it from the item's history here. Birthdays and other yearly dates can't be moved from Calendar.</p>
   <p><b>Adding from Calendar:</b> create an event with <b>#home</b> in the title, and it becomes a one-off task here, assigned to you.</p>
-  <p><b>Reminders are personal,</b> so each person turns them on once: on calendar.google.com, open the shared calendar's <b>Settings and sharing</b>, then add notifications under <b>Event notifications</b> and <b>All-day event notifications</b>.</p>
+  <p><b>On the admin's calendar,</b> bills remind at 9am the day before they're due, and "Book vendor" events sit at 9am on the book-by day with a reminder then. Booked appointments, tasks and family dates use your calendar's usual reminders.</p>
+  <p><b>Reminders are personal,</b> so everyone else turns them on once: on calendar.google.com, open the shared calendar's <b>Settings and sharing</b>, then add notifications under <b>Event notifications</b> and <b>All-day event notifications</b>.</p>
   <p><b>Not seeing events on your own calendar?</b> In Google Calendar settings, under <b>Events from Gmail</b> and <b>Add invitations to my calendar</b>, choose an option that includes invitations from people you know.</p>
 </div></details>
 <details><summary>Phone alerts</summary><div class="answer">
