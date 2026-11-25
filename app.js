@@ -1,4 +1,4 @@
-/* Homebase front end (app.js), Phase 2.1 (Calendar sync, status panel, undo) */
+/* Homebase front end (app.js), Phase 2.4 (Calendar with done/overdue, payments list, shopping lists) */
 'use strict';
 
 /* ================= Config comes from config.js ================= */
@@ -22,6 +22,8 @@ const ICON = {
   x: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
   left: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>',
   right: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>',
+  plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
+  dots: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.6" class="fill"/><circle cx="12" cy="12" r="1.6" class="fill"/><circle cx="19" cy="12" r="1.6" class="fill"/></svg>',
 };
 
 /* ================= State ================= */
@@ -45,7 +47,8 @@ const S = {
   who: store.get('hb_who') === 'mine' ? 'mine' : 'all',
   typeFilter: 'all',
   cal: { mode: 'month', cursor: null, selected: null },
-  bills: { period: 'month', cursor: null, cats: [] },
+  bills: { period: 'month', cursor: null, cats: [], billId: '', payer: '', sort: 'new' },
+  list: { id: store.get('hb_list') || '', store: '' },
   selecting: false,
   picked: new Set(),
   busy: 0,
@@ -225,11 +228,25 @@ function occurrences(i, start, end) {
   return out;
 }
 
-function occMap(start, end) {
+function occMap(start, end, withDone) {
   const map = {};
   filteredItems().forEach((i) => occurrences(i, start, end).forEach((o) => { (map[o.date] = map[o.date] || []).push(o); }));
-  Object.values(map).forEach((list) => list.sort(sortOcc));
+  if (withDone) doneOccurrences(start, end).forEach((o) => { (map[o.date] = map[o.date] || []).push(o); });
+  Object.values(map).forEach((list) => list.sort((a, b) => (!!a.done - !!b.done) || sortOcc(a, b)));
   return map;
+}
+
+/** Done and paid records, shown on the date they were due (same as in Google Calendar). */
+function doneOccurrences(start, end) {
+  return S.data.completions
+    .filter((c) => c.kind === 'done' && c.dueDate && c.dueDate >= start && c.dueDate <= end)
+    .map((c) => {
+      const live = itemById(c.itemId);
+      const item = live || { id: '', type: c.type, title: c.itemTitle, assignees: '' };
+      return { item, date: c.dueDate, time: '', note: '', done: c, gone: !live };
+    })
+    .filter((o) => (S.typeFilter === 'all' || o.item.type === S.typeFilter)
+      && (S.who !== 'mine' || assignees(o.item).includes(me()) || o.done.by === me() || o.done.paidBy === me()));
 }
 function sortOcc(a, b) {
   return a.date.localeCompare(b.date) || (a.time || '99').localeCompare(b.time || '99') || a.item.title.localeCompare(b.item.title);
@@ -344,10 +361,19 @@ function normalizeItem(input) {
       if (!(Number(c.interval) >= 1)) c.interval = '1';
     }
     if (c.type !== 'upkeep' || c.flow !== 'two') c.flow = c.type === 'upkeep' ? 'one' : '';
-    if (c.type !== 'bill') { c.amount = ''; c.category = ''; }
+    if (c.amount && isNaN(Number(c.amount))) c.amount = '';
   }
   return c;
 }
+
+/** Bills default to their usual amount; upkeep and tasks log money only when an amount is entered. */
+function paidAmount(it, p) {
+  const given = p.amount !== undefined && p.amount !== null && String(p.amount).trim() !== '';
+  if (given) return String(p.amount).trim();
+  return it.type === 'bill' && p.useUsual !== false ? String(it.amount || '') : '';
+}
+const DEFAULT_SPEND_CAT = { upkeep: 'Household services', task: 'Other', bill: 'Other' };
+function spendCategory(it) { return it.category || DEFAULT_SPEND_CAT[it.type] || 'Other'; }
 
 function snapshot(it) {
   return JSON.stringify({ dueDate: it.dueDate, stage: it.stage, apptDate: it.apptDate, apptTime: it.apptTime, status: it.status });
@@ -387,13 +413,12 @@ const APPLY = {
     if (d.completions.some((c) => c.id === p.cid)) return;
     const it = d.items.find((i) => i.id === p.id);
     if (!it || it.status !== 'active' || it.type === 'event') return;
-    const isBill = it.type === 'bill';
     const doneDate = p.doneDate || today();
+    const amount = paidAmount(it, p);
     d.completions.push({
-      id: p.cid, itemId: it.id, itemTitle: it.title, type: it.type, category: isBill ? it.category : '', kind: 'done',
-      dueDate: it.stage === 'booked' && it.apptDate ? it.apptDate : it.dueDate, doneDate,
-      amount: isBill ? String(p.amount !== undefined && p.amount !== '' ? p.amount : (it.amount || '')) : '',
-      paidBy: isBill ? String(p.paidBy || by).toLowerCase() : '', note: p.note || '', by, at: nowIso(), prev: snapshot(it),
+      id: p.cid, itemId: it.id, itemTitle: it.title, type: it.type, category: amount !== '' ? spendCategory(it) : '', kind: 'done',
+      dueDate: it.stage === 'booked' && it.apptDate ? it.apptDate : it.dueDate, doneDate, amount,
+      paidBy: amount !== '' ? String(p.paidBy || by).toLowerCase() : '', note: p.note || '', by, at: nowIso(), prev: snapshot(it),
     });
     advanceLocal(it, doneDate, by);
   },
@@ -424,6 +449,37 @@ const APPLY = {
     d.completions = d.completions.filter((x) => x.id !== p.id);
   },
   saveCategories(d, p) { d.categories = p.categories.slice(); },
+  saveList(d, p, by) {
+    d.lists = d.lists || [];
+    const l = d.lists.find((x) => x.id === p.id);
+    if (l) l.name = p.name;
+    else d.lists.push({ id: p.id, name: p.name, status: 'active', createdBy: by, createdAt: nowIso(), updatedAt: nowIso() });
+  },
+  deleteList(d, p) { d.lists = (d.lists || []).filter((x) => x.id !== p.id); },
+  addListItems(d, p, by) {
+    d.listItems = d.listItems || [];
+    d.listMemory = d.listMemory || {};
+    (p.items || []).forEach((x) => {
+      if (d.listItems.some((y) => y.id === x.id)) return;
+      const same = d.listItems.find((y) => y.listId === x.listId && y.name.toLowerCase() === x.name.toLowerCase());
+      if (same) Object.assign(same, { checked: '', checkedBy: '', checkedAt: '', store: x.store || same.store, qty: x.qty || same.qty });
+      else d.listItems.push({ id: x.id, listId: x.listId, name: x.name, store: x.store || '', qty: x.qty || '', checked: '', checkedBy: '', checkedAt: '', status: 'active', createdBy: by, createdAt: nowIso(), updatedAt: nowIso() });
+      const mem = d.listMemory[x.listId] = d.listMemory[x.listId] || {};
+      const k = x.name.toLowerCase();
+      delete mem[k];
+      mem[k] = { name: x.name, store: x.store || '' };
+    });
+  },
+  updateListItem(d, p) {
+    const x = (d.listItems || []).find((y) => y.id === p.id);
+    if (x) Object.assign(x, { name: p.name, store: p.store, qty: p.qty });
+  },
+  toggleListItem(d, p, by) {
+    const x = (d.listItems || []).find((y) => y.id === p.id);
+    if (x) Object.assign(x, { checked: p.checked ? 'yes' : '', checkedBy: p.checked ? by : '', checkedAt: p.checked ? nowIso() : '' });
+  },
+  deleteListItem(d, p) { d.listItems = (d.listItems || []).filter((y) => y.id !== p.id); },
+  clearChecked(d, p) { d.listItems = (d.listItems || []).filter((y) => !(y.listId === p.listId && y.checked === 'yes')); },
   inviteUser(d, p) {
     const email = String(p.email).toLowerCase();
     const u = d.users.find((x) => x.email === email);
@@ -443,6 +499,12 @@ const LANDED = {
   deleteItem: (d, p) => !d.items.some((i) => i.id === p.id),
   deleteCompletion: (d, p) => !d.completions.some((c) => c.id === p.id),
   undoCompletion: (d, p) => !d.completions.some((c) => c.id === p.id),
+  saveList: (d, p) => (d.lists || []).some((l) => l.id === p.id && l.name === p.name),
+  deleteList: (d, p) => !(d.lists || []).some((l) => l.id === p.id),
+  addListItems: (d, p) => (p.items || []).every((x) => (d.listItems || []).some((y) => y.listId === x.listId && y.name.toLowerCase() === x.name.toLowerCase() && y.checked !== 'yes')),
+  toggleListItem: (d, p) => (d.listItems || []).some((y) => y.id === p.id && (y.checked === 'yes') === !!p.checked),
+  deleteListItem: (d, p) => !(d.listItems || []).some((y) => y.id === p.id),
+  clearChecked: (d, p) => !(d.listItems || []).some((y) => y.listId === p.listId && y.checked === 'yes'),
   archiveItem: (d, p) => d.items.some((i) => i.id === p.id && i.status === 'archived'),
   restoreItem: (d, p) => d.items.some((i) => i.id === p.id && i.status === 'active'),
   book: (d, p) => d.items.some((i) => i.id === p.id && i.stage === 'booked' && i.apptDate === p.apptDate),
@@ -755,8 +817,10 @@ function installRowHTML() {
 function render() {
   if (!S.data) return;
   $('#today-label').textContent = fmt(today(), { weekday: 'long', month: 'long', day: 'numeric' });
-  const views = { upcoming: renderUpcoming, calendar: renderCalendar, bills: renderBills, more: renderMore };
+  const views = { upcoming: renderUpcoming, calendar: renderCalendar, lists: renderLists, bills: renderBills, more: renderMore };
   $('#main').innerHTML = views[S.tab]();
+  $('#fab').hidden = S.tab === 'lists';
+  document.body.classList.toggle('on-lists', S.tab === 'lists');
   document.querySelectorAll('.tabbar [data-tab]').forEach((b) => {
     if (b.dataset.tab === S.tab) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
   });
@@ -776,7 +840,22 @@ function filtersHTML() {
   </div>`;
 }
 
+function doneRowHTML(o) {
+  const i = o.item;
+  const c = o.done;
+  const paid = c.amount !== '' ? `Paid ${peso(c.amount)}` : (i.type === 'bill' ? 'Paid' : 'Done');
+  const by = displayName(c.paidBy || c.by);
+  return `<button class="row t-${i.type} is-done" data-act="${o.gone ? 'noop' : 'open'}" data-id="${esc(i.id)}">
+    <span class="stub" aria-hidden="true"><small>${fmt(o.date, { weekday: 'short' })}</small><b>${toD(o.date).getUTCDate()}</b><small>${fmt(o.date, { month: 'short' })}</small></span>
+    <span class="body">
+      <span class="title"><span class="done-check" aria-hidden="true">✓</span> ${esc(i.title)}</span>
+      <span class="meta"><span>${paid} ${c.doneDate !== c.dueDate ? 'on ' + fmtShort(c.doneDate) + ' ' : ''}by ${esc(by)}</span></span>
+    </span>
+  </button>`;
+}
+
 function rowHTML(o) {
+  if (o.done) return doneRowHTML(o);
   const i = o.item;
   const late = o.date < today() && i.type !== 'event';
   const note = o.note != null ? o.note : '';
@@ -836,7 +915,7 @@ function renderCalendar() {
   if (c.mode === 'month') {
     const start = weekStart(monthStart(c.cursor));
     const end = addDays(start, 41);
-    const map = occMap(start, end);
+    const map = occMap(start, end, true);
     const t = today();
     label = fmt(c.cursor, { month: 'long', year: 'numeric' });
     const dows = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d) => `<div class="cal-dow">${d}</div>`).join('');
@@ -845,7 +924,7 @@ function renderCalendar() {
       const d = addDays(start, k);
       const list = map[d] || [];
       const out = d.slice(0, 7) !== c.cursor.slice(0, 7);
-      const dots = list.slice(0, 3).map((o) => `<span class="dot t-${o.item.type}${o.date < t && o.item.type !== 'event' ? ' is-late' : ''}"></span>`).join('')
+      const dots = list.slice(0, 3).map((o) => `<span class="dot t-${o.item.type}${o.done ? ' is-done' : o.date < t && o.item.type !== 'event' ? ' is-late' : ''}"></span>`).join('')
         + (list.length > 3 ? '<span class="more-dot">+</span>' : '');
       cells += `<button class="cal-cell${out ? ' out' : ''}${d === t ? ' today' : ''}${d === c.selected ? ' sel' : ''}" data-act="cal-day" data-d="${d}" aria-label="${fmtLong(d)}, ${list.length} item${list.length === 1 ? '' : 's'}">
         <span class="n">${toD(d).getUTCDate()}</span><span class="dots">${dots}</span></button>`;
@@ -857,7 +936,7 @@ function renderCalendar() {
   } else {
     const start = weekStart(c.cursor);
     const end = addDays(start, 6);
-    const map = occMap(start, end);
+    const map = occMap(start, end, true);
     const t = today();
     label = `${fmtShort(start)} – ${fmtShort(end)}`;
     grid = '';
@@ -896,10 +975,51 @@ function periodRange() {
   return { start: monthStart(b.cursor), end: monthEnd(b.cursor), label: fmt(b.cursor, { month: 'long', year: 'numeric' }) };
 }
 
+/** Every logged payment: bills plus upkeep and tasks done with an amount. */
 function billPayments() {
   const cats = S.bills.cats;
-  return S.data.completions.filter((c) => c.type === 'bill' && c.kind === 'done' && c.amount !== '' && !isNaN(Number(c.amount)))
+  return S.data.completions.filter((c) => c.kind === 'done' && c.amount !== '' && !isNaN(Number(c.amount)))
     .filter((c) => !cats.length || cats.includes(c.category || 'Uncategorized'));
+}
+
+function paymentsHTML(inPeriod, r) {
+  const b = S.bills;
+  const opts = (pairs, cur) => pairs.map(([v, l]) => `<option value="${esc(v)}"${v === cur ? ' selected' : ''}>${esc(l)}</option>`).join('');
+  const billNames = [...new Map(inPeriod.map((c) => [c.itemId, (itemById(c.itemId) || {}).title || c.itemTitle])).entries()]
+    .sort((a, z) => a[1].localeCompare(z[1]));
+  const payers = [...new Set(inPeriod.map((c) => c.paidBy).filter(Boolean))].sort((a, z) => displayName(a).localeCompare(displayName(z)));
+  if (b.billId && !billNames.some(([id]) => id === b.billId)) b.billId = '';
+  if (b.payer && !payers.includes(b.payer)) b.payer = '';
+
+  let rows = inPeriod.filter((c) => (!b.billId || c.itemId === b.billId) && (!b.payer || c.paidBy === b.payer));
+  const sorters = {
+    new: (x, y) => y.doneDate.localeCompare(x.doneDate) || String(y.at).localeCompare(String(x.at)),
+    old: (x, y) => x.doneDate.localeCompare(y.doneDate) || String(x.at).localeCompare(String(y.at)),
+    high: (x, y) => Number(y.amount) - Number(x.amount),
+    low: (x, y) => Number(x.amount) - Number(y.amount),
+  };
+  rows = rows.slice().sort(sorters[b.sort] || sorters.new);
+  const total = rows.reduce((t, c) => t + Number(c.amount), 0);
+
+  const list = rows.length ? `<div class="list">${rows.map((c) => {
+    const it = itemById(c.itemId);
+    return `<button class="pay-row t-${esc(c.type)}" data-act="${it ? 'open' : 'noop'}" data-id="${esc(c.itemId)}">
+      <span class="pay-date">${fmt(c.doneDate, { month: 'short', day: 'numeric' })}</span>
+      <span class="body"><span class="title">${esc((it && it.title) || c.itemTitle)}</span>
+        <span class="meta">${[c.paidBy ? 'Paid by ' + esc(displayName(c.paidBy)) : '', esc(c.category || 'Uncategorized')].filter(Boolean).join(' · ')}</span></span>
+      <span class="amt">${peso(c.amount)}</span>
+    </button>`;
+  }).join('')}</div>
+    <p class="pay-foot">${rows.length} payment${rows.length === 1 ? '' : 's'} · <b>${peso(total)}</b></p>`
+    : '<p class="day-empty">No payments match these filters.</p>';
+
+  return `<h3 class="group-h">Payments <span class="count">${r.label}</span></h3>
+    <div class="pay-filters">
+      <label><span>Item</span><select data-pay="billId">${opts([['', 'All']].concat(billNames), b.billId)}</select></label>
+      <label><span>Paid by</span><select data-pay="payer">${opts([['', 'Anyone']].concat(payers.map((e) => [e, displayName(e)])), b.payer)}</select></label>
+      <label><span>Sort</span><select data-pay="sort">${opts([['new', 'Newest'], ['old', 'Oldest'], ['high', 'Highest'], ['low', 'Lowest']], b.sort)}</select></label>
+    </div>
+    ${list}`;
 }
 
 function renderBills() {
@@ -948,15 +1068,171 @@ function renderBills() {
       <p class="total">${peso(total)}</p>
       <p class="total-sub">${inPeriod.length} payment${inPeriod.length === 1 ? '' : 's'} logged${b.cats.length ? ' in selected categories' : ''}</p>
       <div class="chips scroll" role="group" aria-label="Categories">${chips}</div>
-      <svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Monthly bill totals for the last 12 months">${bars}</svg>
+      <svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Monthly spending for the last 12 months">${bars}</svg>
       ${catRows.length ? `<ul class="breakdown">${catRows.map(([k, v]) => `<li>
           <div class="top-line"><span>${esc(k)}</span><span class="amt">${peso(v)}</span></div>
           <div class="track"><div class="fillbar" style="width:${Math.max(2, (v / maxCat) * 100).toFixed(1)}%"></div></div></li>`).join('')}</ul>`
         : '<p class="day-empty">No payments logged in this period.</p>'}
     </section>
+    ${paymentsHTML(inPeriod, r)}
     <h3 class="group-h">Your bills <span class="count">${bills.length}</span></h3>
     ${bills.length ? `<div class="list">${bills.map(rowHTML).join('')}</div>`
       : '<div class="empty"><strong>No bills yet</strong>Tap + and choose Bill to track a due date and what you pay.</div>'}`;
+}
+
+/* ----- Shopping lists ----- */
+const ANYWHERE = 'Anywhere';
+
+function activeLists() {
+  return (S.data.lists || []).slice().sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+}
+function currentList() {
+  const lists = activeLists();
+  return lists.find((l) => l.id === S.list.id) || lists[0] || null;
+}
+function listItemsOf(listId) { return (S.data.listItems || []).filter((x) => x.listId === listId); }
+function memoryOf(listId) { return (S.data.listMemory && S.data.listMemory[listId]) || {}; }
+
+/**
+ * One line of the quick-add box: "Eggs, 2 dozen @S&R".
+ * Text after "@" is the store; text after the first comma is the quantity or a note.
+ * With no "@store", the store last used for that item on this list is filled in.
+ */
+function parseListLine(line, listId) {
+  let text = String(line || '').replace(/^[\s\-*•·]+/, '').replace(/^\[[ xX]?\]\s*/, '').trim();
+  if (!text) return null;
+  let store = '';
+  const at = text.lastIndexOf('@');
+  if (at > 0) { store = text.slice(at + 1).trim(); text = text.slice(0, at).trim(); }
+  let qty = '';
+  const comma = text.indexOf(',');
+  if (comma > 0) { qty = text.slice(comma + 1).trim(); text = text.slice(0, comma).trim(); }
+  if (!text) return null;
+  const known = memoryOf(listId)[text.toLowerCase()];
+  if (known) { text = known.name; if (!store) store = known.store || ''; }
+  return { name: text.slice(0, 80), store: store.slice(0, 40), qty: qty.slice(0, 40) };
+}
+
+function storesOf(listId) {
+  const set = new Set();
+  listItemsOf(listId).forEach((x) => set.add(x.store || ANYWHERE));
+  return [...set].sort((a, b) => (a === ANYWHERE) - (b === ANYWHERE) || a.localeCompare(b));
+}
+
+function renderLists() {
+  const list = currentList();
+  const lists = activeLists();
+  const switcher = `<div class="chips scroll" role="group" aria-label="Lists">
+    ${lists.map((l) => {
+      const open = listItemsOf(l.id).filter((x) => x.checked !== 'yes').length;
+      return `<button class="chip" data-act="list-pick" data-v="${l.id}" aria-pressed="${list && l.id === list.id}">${esc(l.name)}${open ? ` <span class="chip-n">${open}</span>` : ''}</button>`;
+    }).join('')}
+    <button class="chip" data-act="list-manage">Edit lists</button>
+  </div>`;
+  if (!list) {
+    return `<div class="head-row"><h2 class="h">Lists</h2></div>${switcher}
+      <div class="empty"><strong>No lists yet</strong>Tap Edit lists to make one.</div>`;
+  }
+
+  const items = listItemsOf(list.id);
+  const stores = storesOf(list.id);
+  if (S.list.store && !stores.includes(S.list.store)) S.list.store = '';
+  const shown = S.list.store ? items.filter((x) => (x.store || ANYWHERE) === S.list.store) : items;
+  const checkedCount = items.filter((x) => x.checked === 'yes').length;
+
+  const storeChips = stores.length > 1 ? `<div class="chips scroll" role="group" aria-label="Stores">
+    <button class="chip" data-act="list-store" data-v="" aria-pressed="${!S.list.store}">All stores</button>
+    ${stores.map((st) => `<button class="chip" data-act="list-store" data-v="${esc(st)}" aria-pressed="${S.list.store === st}">${esc(st)}</button>`).join('')}
+  </div>` : '';
+
+  const onList = new Set(items.map((x) => x.name.toLowerCase()));
+
+  const groups = (S.list.store ? [S.list.store] : stores).map((st) => {
+    const inStore = shown.filter((x) => (x.store || ANYWHERE) === st)
+      .sort((a, b) => (a.checked === 'yes') - (b.checked === 'yes') ||
+        (a.checked === 'yes' ? String(b.checkedAt).localeCompare(String(a.checkedAt)) : String(a.createdAt).localeCompare(String(b.createdAt))));
+    if (!inStore.length) return '';
+    const open = inStore.filter((x) => x.checked !== 'yes').length;
+    return `<h3 class="group-h">${esc(st)} <span class="count">${open}</span></h3>
+      <div class="list">${inStore.map(listItemHTML).join('')}</div>`;
+  }).join('');
+
+  return `<div class="head-row"><h2 class="h">${esc(list.name)}</h2>
+      ${checkedCount ? `<button class="btn sm quiet" data-act="list-clear">Clear bought (${checkedCount})</button>` : ''}</div>
+    ${switcher}
+    <form id="list-add" class="list-add" autocomplete="off" novalidate>
+      <textarea name="text" rows="1" enterkeyhint="done" placeholder="Add item, e.g. Eggs @S&amp;R" aria-label="Add items"></textarea>
+      <button class="btn primary" type="submit" aria-label="Add">${ICON.plus}</button>
+    </form>
+    ${suggestionChips(list.id, onList)}
+    ${storeChips}
+    ${groups || `<div class="empty"><strong>Nothing on ${esc(list.name)}</strong>Add items above. Paste several lines to add them all at once.</div>`}`;
+}
+
+/** Quick re-add: items bought before that aren't on the list now, most recent first. */
+function suggestionChips(listId, onList) {
+  const recent = Object.values(memoryOf(listId)); // oldest first
+  const picks = recent.filter((m) => !onList.has(m.name.toLowerCase())).slice(-8).reverse();
+  if (!picks.length) return '';
+  return `<div class="chips scroll again" role="group" aria-label="Add again">
+    <span class="again-label">Again?</span>
+    ${picks.map((m) => `<button class="chip" data-act="list-again" data-v="${esc(m.name)}">${esc(m.name)}</button>`).join('')}
+  </div>`;
+}
+
+function listItemHTML(x) {
+  const on = x.checked === 'yes';
+  return `<div class="li-row${on ? ' done' : ''}">
+    <button class="li-main" data-act="list-toggle" data-id="${x.id}" aria-pressed="${on}">
+      <span class="tick${on ? ' on' : ''}" aria-hidden="true"></span>
+      <span class="body"><span class="title">${esc(x.name)}</span>${x.qty ? `<span class="meta">${esc(x.qty)}</span>` : ''}</span>
+      ${on && x.checkedBy ? `<span class="who">${avatar(x.checkedBy)}</span>` : ''}
+    </button>
+    <button class="icon li-edit" data-act="list-edit" data-id="${x.id}" aria-label="Edit ${esc(x.name)}">${ICON.dots}</button>
+  </div>`;
+}
+
+function addListLines(text) {
+  const list = currentList();
+  if (!list) return 0;
+  const seen = new Set();
+  const items = String(text || '').split(/\r?\n/).map((l) => parseListLine(l, list.id)).filter(Boolean)
+    .filter((x) => { const k = x.name.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; })
+    .map((x) => ({ id: rid('x'), listId: list.id, ...x }));
+  if (!items.length) return 0;
+  enqueue('addListItems', { items }, items.length === 1 ? `Added ${items[0].name}` : `Added ${items.length} items`);
+  return items.length;
+}
+
+function openListItemEdit(id) {
+  const x = (S.data.listItems || []).find((y) => y.id === id);
+  if (!x) return;
+  const stores = storesOf(x.listId).filter((s) => s !== ANYWHERE);
+  openSheet(`${sheetHead('Edit item')}
+    <form id="list-item-form" class="sheet-body form" data-id="${x.id}" novalidate>
+      <label class="field"><span>Item</span><input name="name" required value="${esc(x.name)}" autocomplete="off"></label>
+      <label class="field"><span>Quantity or note</span><input name="qty" value="${esc(x.qty || '')}" autocomplete="off" placeholder="2 dozen"></label>
+      <label class="field"><span>Store</span><input name="store" value="${esc(x.store || '')}" list="store-suggest" autocomplete="off" placeholder="${ANYWHERE}">
+        <datalist id="store-suggest">${stores.map((s) => `<option value="${esc(s)}"></option>`).join('')}</datalist></label>
+      <button class="btn primary" type="submit">Save</button>
+      <button class="btn quiet danger" type="button" data-act="list-item-del" data-id="${x.id}">Remove from list</button>
+    </form>`, { small: true });
+}
+
+function openListManage() {
+  const rows = activeLists().map((l) => `<div class="member">
+      <div class="who-info">${esc(l.name)}<small>${listItemsOf(l.id).filter((x) => x.checked !== 'yes').length} to buy</small></div>
+      <button class="btn sm" data-act="list-rename" data-id="${l.id}">Rename</button>
+      ${isAdmin() ? `<button class="btn sm quiet danger" data-act="list-delete" data-id="${l.id}">Delete</button>` : ''}
+    </div>`).join('');
+  openSheet(`${sheetHead('Edit lists')}
+    <div class="sheet-body">
+      <div class="panel">${rows || '<p class="day-empty">No lists yet.</p>'}</div>
+      <form id="list-new" class="inline" novalidate>
+        <input name="name" placeholder="New list, e.g. Baby" autocomplete="off" aria-label="New list name">
+        <button class="btn" type="submit">Add list</button>
+      </form>
+    </div>`, { small: true });
 }
 
 /* ----- More ----- */
@@ -1076,9 +1352,19 @@ const HELP_HTML = `
 <details><summary>Why the list sometimes updates a moment after opening</summary><div class="answer">
   <p>Homebase shows the copy saved on this phone right away, then checks for changes from the rest of the family. Your own changes appear immediately and save in the background. The thin bar at the top means it's working. If you close the app before a change finishes saving, it continues the next time you open Homebase. Signing out removes the saved copy from this phone.</p>
 </div></details>
+<details><summary>Shopping lists</summary><div class="answer">
+  <p>Open <b>Lists</b> and type an item. Add a store with <b>@</b> and a quantity or note after a comma: <b>Eggs, 2 dozen @S&amp;R</b>. Paste several lines to add them all at once.</p>
+  <p>Homebase remembers where you bought each item, so next time "Eggs" goes under S&amp;R by itself. Items with no store go under <b>Anywhere</b>.</p>
+  <p>Tap an item to tick it off. <b>Clear bought</b> removes ticked items, and the chips under <b>Again?</b> add recent items back with one tap. Ticks made without signal save once your phone is back online.</p>
+</div></details>
+<details><summary>Payments and spending</summary><div class="answer">
+  <p>Bills ask for the amount when you mark them paid. Upkeep and tasks can log an amount too: fill in <b>Amount paid</b> when you tap <b>It's done</b>, or leave it empty if nothing was paid. A usual cost on the item fills it in for you.</p>
+  <p>The <b>Bills</b> tab totals everything paid in the chosen month, quarter or year. Under <b>Payments</b>, filter by item, category or who paid, and sort by date or amount. Every record is also in the <b>Completions</b> tab of the Google Sheet.</p>
+</div></details>
 <details><summary>Google Calendar</summary><div class="answer">
   <p>Every item appears on the shared family calendar as one event at its next date, with a link back here. People assigned to an item are added as guests, so it also shows on their own calendar.</p>
-  <p><b>Changes in Calendar come back here:</b> drag an event to a new date to reschedule that one time, or edit its title or notes. Deleting an event skips that occurrence. Undo it from the item's history here. Birthdays and other yearly dates can't be moved from Calendar.</p>
+  <p><b>Colours:</b> each kind of item keeps its own colour. Anything past its date and not done turns red with <b>Overdue:</b> in front. When something is done or paid, its event stays on the date it was due, turns grey and gets a ✓, and the next one gets a fresh event. The Calendar tab here shows the same.</p>
+  <p><b>Changes in Calendar come back here:</b> drag an event to a new date to reschedule that one time, or edit its title or notes. Deleting an upcoming event skips that occurrence. Undo it from the item's history here. Grey done records can be moved or deleted in Calendar without changing anything here. Birthdays and other yearly dates can't be moved from Calendar.</p>
   <p><b>Adding from Calendar:</b> create an event with <b>#home</b> in the title, and it becomes a one-off task here, assigned to you.</p>
   <p><b>On the admin's calendar,</b> bills remind at 9am the day before they're due, and "Book vendor" events sit at 9am on the book-by day with a reminder then. Booked appointments, tasks and family dates use your calendar's usual reminders.</p>
   <p><b>Reminders are personal,</b> so everyone else turns them on once: on calendar.google.com, open the shared calendar's <b>Settings and sharing</b>, then add notifications under <b>Event notifications</b> and <b>All-day event notifications</b>.</p>
@@ -1132,7 +1418,8 @@ function statusFor(i, v) {
   if (i.status === 'done') return { label: 'Finished', detail: 'This one-off item is done.', tone: 'ok' };
   if (i.status === 'archived') return { label: 'Archived', detail: 'Hidden from the schedule. Restore it to bring it back.', tone: '' };
   const late = v.date < today() && i.type !== 'event';
-  const when = (d, t) => `${fmtLong(d)}${t ? ', ' + fmtTime(t) : ''} (${rel(d).toLowerCase()})`;
+  const relText = (d) => { const r = rel(d); return /^(Today|Tomorrow|In |\d)/.test(r) ? r.toLowerCase() : r; };
+  const when = (d, t) => `${fmtLong(d)}${t ? ', ' + fmtTime(t) : ''} (${relText(d)})`;
   if (i.type === 'event') return { label: rel(v.date), detail: `${fmtLong(v.date)}${v.note ? '. ' + v.note : ''}`, tone: '' };
   if (v.stage === 'to_book') {
     return { label: late ? 'Not booked yet, overdue' : 'Not booked yet', detail: `Book by ${when(v.date)}. Service due ${fmtLong(i.dueDate)}.`, tone: late ? 'late' : '' };
@@ -1175,6 +1462,8 @@ function openDetail(id) {
   if (i.type === 'bill') {
     if (i.category) facts.push(['Category', esc(i.category)]);
     if (i.amount) facts.push(['Usual amount', peso(i.amount)]);
+  } else if (i.type !== 'event' && i.amount) {
+    facts.push(['Usual cost', `${peso(i.amount)} · ${esc(spendCategory(i))}`]);
   }
   if (i.type === 'upkeep' && (i.vendorName || i.vendorPhone)) {
     const tel = i.vendorPhone ? `<a href="tel:${esc(i.vendorPhone.replace(/[^\d+]/g, ''))}">${esc(i.vendorPhone)}</a>` : '';
@@ -1210,8 +1499,8 @@ function openDetail(id) {
       ${pts.map((p) => `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="2.5"/>`).join('')}</svg>`;
   }
   const histHTML = hist.length ? `<h3 class="section-h">History</h3>${spark}<ul class="hist">${hist.map((c) => {
-    const what = c.kind === 'skipped' ? 'Skipped'
-      : c.amount !== '' ? `Paid ${peso(c.amount)}${c.paidBy ? ' by ' + esc(displayName(c.paidBy)) : ''}` : 'Done';
+    const paid = c.amount !== '' ? `Paid ${peso(c.amount)}${c.paidBy ? ' by ' + esc(displayName(c.paidBy)) : ''}` : '';
+    const what = c.kind === 'skipped' ? 'Skipped' : i.type === 'bill' ? (paid || 'Paid') : paid ? `Done · ${paid.charAt(0).toLowerCase() + paid.slice(1)}` : 'Done';
     let btn = '';
     if (canUndo(c)) {
       const label = c.kind === 'done' && i.type === 'bill' ? 'Mark unpaid' : 'Undo';
@@ -1246,8 +1535,10 @@ function openComplete(i) {
   const html = `${sheetHead(isBill ? 'Mark paid' : "It's done")}
     <form id="complete-form" class="sheet-body form" data-id="${i.id}" data-cid="${rid('c')}" novalidate>
       <p style="margin:0;font-weight:600">${esc(i.title)}</p>
-      ${isBill ? `<label class="field"><span>Amount paid (₱)</span><input name="amount" type="number" inputmode="decimal" step="0.01" min="0" value="${esc(i.amount || '')}"></label>
-        <label class="field"><span>Paid by</span><select name="paidBy">${users.map((u) => `<option value="${esc(u.email)}"${u.email === me() ? ' selected' : ''}>${esc(displayName(u.email))}</option>`).join('')}</select></label>` : ''}
+      <div class="two-col">
+        <label class="field"><span>${isBill ? 'Amount paid (₱)' : 'Amount paid (₱, optional)'}</span><input name="amount" type="number" inputmode="decimal" step="0.01" min="0" value="${esc(i.amount || '')}" placeholder="${isBill ? '' : 'Leave empty if nothing was paid'}"></label>
+        <label class="field"><span>Paid by</span><select name="paidBy">${users.map((u) => `<option value="${esc(u.email)}"${u.email === me() ? ' selected' : ''}>${esc(displayName(u.email))}</option>`).join('')}</select></label>
+      </div>
       <label class="field"><span>${isBill ? 'Date paid' : 'Date done'}</span><input name="doneDate" type="date" required value="${today()}">${afterNote}</label>
       <label class="field"><span>Note (optional)</span><input name="note" autocomplete="off"></label>
       <button class="btn primary" type="submit">${isBill ? 'Mark paid' : 'Save'}</button>
@@ -1296,6 +1587,12 @@ function openForm(type, it) {
     <label class="field"><span>Date</span><input name="eventDate" type="date" required value="${esc(e.eventDate || '')}"><span class="hint">Use the original date, such as the birth year or wedding year.</span></label>
     <label class="check"><input type="checkbox" name="showYears" value="yes"${e.showYears !== 'no' ? ' checked' : ''}> Show age or years</label>`;
 
+  const catOptions = (cur) => S.data.categories.map((c) => `<option${cur === c ? ' selected' : ''}>${esc(c)}</option>`).join('')
+    + (cur && !S.data.categories.includes(cur) ? `<option selected>${esc(cur)}</option>` : '');
+  const costFields = type !== 'upkeep' && type !== 'task' ? '' : `<div class="two-col">
+      <label class="field"><span>Usual cost (₱, optional)</span><input name="amount" type="number" inputmode="decimal" step="0.01" min="0" value="${esc(e.amount || '')}"></label>
+      <label class="field"><span>Spending category</span><select name="category">${catOptions(e.category || DEFAULT_SPEND_CAT[type])}</select></label>
+    </div>`;
   const billFields = type !== 'bill' ? '' : `<div class="two-col">
       <label class="field"><span>Usual amount (₱)</span><input name="amount" type="number" inputmode="decimal" step="0.01" min="0" value="${esc(e.amount || '')}"></label>
       <label class="field"><span>Category</span><select name="category">
@@ -1342,7 +1639,7 @@ function openForm(type, it) {
   const html = `${sheetHead(`${it ? 'Edit' : 'New'} ${TYPES[type].label.toLowerCase()}`, '<button class="btn sm primary" type="submit" form="item-form">Save</button>')}
     <form id="item-form" class="sheet-body form t-${type}" data-type="${type}" data-id="${esc(e.id || '')}" data-new-id="${rid('i')}" novalidate>
       <label class="field"><span>Title</span><input name="title" required autocomplete="off" value="${esc(e.title || '')}" placeholder="${esc(placeholders[type])}"></label>
-      ${eventFields}${flowFields}${dueFields}${billFields}${recurFields}
+      ${eventFields}${flowFields}${dueFields}${billFields}${recurFields}${costFields}
       <fieldset class="field"><legend>${type === 'event' ? 'Who gets reminded' : 'Assigned to'}</legend><div class="chips">${people}</div>
         <span class="hint">${type === 'event' ? 'Optional.' : 'Leave empty to let anyone tick it off.'}</span></fieldset>
       ${vendorFields}
@@ -1405,8 +1702,50 @@ document.addEventListener('click', async (ev) => {
       toast('Hidden. You can still install from More.');
       render(); break;
     case 'reload': if (S.data) refresh(); else load(); break;
+    case 'noop': break;
+    case 'list-pick': S.list.id = v; S.list.store = ''; store.set('hb_list', v); render(); break;
+    case 'list-store': S.list.store = v; render(); break;
+    case 'list-manage': openListManage(); break;
+    case 'list-toggle': {
+      const x = (S.data.listItems || []).find((y) => y.id === a.dataset.id);
+      if (x) enqueue('toggleListItem', { id: x.id, checked: x.checked !== 'yes' });
+      break;
+    }
+    case 'list-edit': openListItemEdit(a.dataset.id); break;
+    case 'list-item-del': {
+      const x = (S.data.listItems || []).find((y) => y.id === a.dataset.id);
+      if (!x) break;
+      const back = { id: rid('x'), listId: x.listId, name: x.name, store: x.store, qty: x.qty };
+      closeAllSheets();
+      enqueue('deleteListItem', { id: x.id }, `Removed ${x.name}`, () => enqueue('addListItems', { items: [back] }, `Added ${x.name} back`));
+      break;
+    }
+    case 'list-clear': {
+      const list = currentList();
+      if (!list) break;
+      const gone = listItemsOf(list.id).filter((x) => x.checked === 'yes')
+        .map((x) => ({ id: rid('x'), listId: x.listId, name: x.name, store: x.store, qty: x.qty }));
+      enqueue('clearChecked', { listId: list.id }, `Cleared ${gone.length} bought`,
+        () => enqueue('addListItems', { items: gone }, 'Restored as still to buy'));
+      break;
+    }
+    case 'list-again': addListLines(v); break;
+    case 'list-rename': {
+      const l = activeLists().find((x) => x.id === a.dataset.id);
+      const name = l && prompt('Rename list', l.name);
+      if (name && name.trim() && name.trim() !== l.name) { enqueue('saveList', { id: l.id, name: name.trim().slice(0, 40) }, 'List renamed'); closeAllSheets(); openListManage(); }
+      break;
+    }
+    case 'list-delete': {
+      const l = activeLists().find((x) => x.id === a.dataset.id);
+      if (!l || !confirm(`Delete the ${l.name} list and everything on it?`)) break;
+      enqueue('deleteList', { id: l.id }, 'List deleted');
+      closeAllSheets(); openListManage();
+      break;
+    }
     case 'tab':
       S.tab = a.dataset.tab;
+      if (S.tab === 'lists') S.list.store = '';
       if (S.tab !== 'upcoming') { S.selecting = false; S.picked.clear(); }
       render(); window.scrollTo(0, 0); break;
     case 'who': S.who = v; store.set('hb_who', v); render(); break;
@@ -1518,6 +1857,27 @@ document.addEventListener('click', async (ev) => {
   }
 });
 
+document.addEventListener('change', (ev) => {
+  const sel = ev.target.closest('select[data-pay]');
+  if (!sel) return;
+  S.bills[sel.dataset.pay] = sel.value;
+  render();
+});
+
+// Lists quick-add: Enter adds, Shift+Enter makes a new line; the box grows with pasted lines.
+document.addEventListener('keydown', (ev) => {
+  if (ev.target.matches && ev.target.matches('#list-add textarea') && ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
+    ev.preventDefault();
+    ev.target.form.requestSubmit();
+  }
+});
+document.addEventListener('input', (ev) => {
+  if (ev.target.matches && ev.target.matches('#list-add textarea')) {
+    ev.target.style.height = 'auto';
+    ev.target.style.height = Math.min(ev.target.scrollHeight, 180) + 'px';
+  }
+});
+
 document.addEventListener('change', async (ev) => {
   const s = ev.target.closest('select[data-act="user-role"]');
   if (!s) return;
@@ -1544,13 +1904,42 @@ document.addEventListener('submit', async (ev) => {
     enqueue('saveItem', { item }, f.dataset.id ? 'Changes saved' : `${TYPES[type].label} added`);
   }
 
+  if (f.id === 'list-add') {
+    const box = f.elements.text;
+    if (addListLines(box.value)) {
+      box.value = '';
+      box.style.height = 'auto';
+      const again = $('#list-add textarea');
+      if (again) again.focus();
+    }
+    return;
+  }
+
+  if (f.id === 'list-item-form') {
+    const name = String(fd.get('name') || '').trim();
+    if (!name) { toast('Give the item a name.', true); return; }
+    closeAllSheets();
+    enqueue('updateListItem', { id: f.dataset.id, name, qty: String(fd.get('qty') || '').trim(), store: String(fd.get('store') || '').trim() }, 'Saved');
+    return;
+  }
+
+  if (f.id === 'list-new') {
+    const name = String(fd.get('name') || '').trim().slice(0, 40);
+    if (!name) return;
+    const id = rid('l');
+    S.list.id = id; store.set('hb_list', id);
+    closeAllSheets();
+    enqueue('saveList', { id, name }, `${name} list added`);
+    return;
+  }
+
   if (f.id === 'complete-form') {
     const i = itemById(f.dataset.id);
     const payload = { id: f.dataset.id, cid: f.dataset.cid, doneDate: fd.get('doneDate') || today(), note: fd.get('note') || '' };
-    if (i.type === 'bill') {
-      payload.amount = fd.get('amount'); payload.paidBy = fd.get('paidBy');
-      if (payload.amount && isNaN(Number(payload.amount))) { toast('The amount should be a number.', true); return; }
-    }
+    payload.amount = String(fd.get('amount') || '').trim();
+    payload.paidBy = fd.get('paidBy');
+    payload.useUsual = false; // the form already shows the usual amount; an emptied box means nothing was paid
+    if (payload.amount && isNaN(Number(payload.amount))) { toast('The amount should be a number.', true); return; }
     closeAllSheets();
     enqueue('complete', payload, i.type === 'bill' ? 'Marked paid' : 'Marked done',
       () => enqueue('undoCompletion', { id: payload.cid }, i.type === 'bill' ? 'Marked unpaid' : 'Undone'));
